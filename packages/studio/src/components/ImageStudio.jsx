@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { generateImage, generateI2I, uploadFile } from "../muapi.js";
+import { generateImage, generateI2I, uploadFile } from "../litellmApi.js";
 import {
   t2iModels,
   i2iModels,
@@ -15,6 +15,13 @@ import {
   getEffectsForI2IModel,
   getDefaultEffectForI2IModel,
 } from "../models.js";
+import {
+  isLiteLLMProvider,
+  fetchLiteLLMModels,
+  getAspectRatiosForLiteLLMModel,
+  getSizeForLiteLLMModel,
+  resolveLiteLLMModelId,
+} from "../litellmModels.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -33,6 +40,18 @@ async function downloadImage(url, filename) {
   } catch {
     window.open(url, "_blank");
   }
+}
+
+function getNearestAspectRatio(value, options) {
+  if (!options.length || options.includes(value)) return value;
+  const [w, h] = String(value || '').split(':').map(Number);
+  const orientation = !w || !h || w === h ? 'square' : (w > h ? 'landscape' : 'portrait');
+  const candidates = orientation === 'landscape'
+    ? ['3:2', '16:9', '4:3', '21:9', '1:1']
+    : orientation === 'portrait'
+      ? ['2:3', '9:16', '3:4', '1:1']
+      : ['1:1'];
+  return candidates.find((candidate) => options.includes(candidate)) || options[0];
 }
 
 // ─── UploadButton (inline picker) ───────────────────────────────────────────
@@ -746,19 +765,57 @@ export default function ImageStudio({
 }) {
   const PERSIST_KEY = "hg_image_studio_persistent";
 
+  // ── LiteLLM detection & models (fetched on mount when active) ──────────
+  const useLiteLLM = isLiteLLMProvider();
+  const [litellmModels, setLiteLLMModels] = useState([]);
+  const [litellmModelsLoaded, setLiteLLMModelsLoaded] = useState(false);
+
+  // ── Effective model lists from LiteLLM ────────────────────────────────
+  const effectiveT2i = useLiteLLM
+    ? (litellmModels.length > 0 ? litellmModels : [{ id: '__loading__', name: 'Loading models...' }])
+    : t2iModels;
+  const effectiveI2i = useLiteLLM
+    ? (litellmModels.length > 0 ? litellmModels : [{ id: '__loading__', name: 'Loading models...' }])
+    : i2iModels;
+
   // ── Model / mode state ──────────────────────────────────────────────────
   const [imageMode, setImageMode] = useState(false); // false=t2i, true=i2i
-  const [selectedModelId, setSelectedModelId] = useState(t2iModels[0].id);
-  const [selectedModelName, setSelectedModelName] = useState(t2iModels[0].name);
+  const firstModel = effectiveT2i[0] || { id: '', name: '' };
+  const [selectedModelId, setSelectedModelId] = useState(firstModel.id);
+  const [selectedModelName, setSelectedModelName] = useState(firstModel.name);
   const [selectedAr, setSelectedAr] = useState(
-    t2iModels[0].inputs?.aspect_ratio?.default || "1:1",
+    firstModel.inputs?.aspect_ratio?.default || "1:1",
   );
   const [selectedQuality, setSelectedQuality] = useState(() => {
-    const resolutions = getResolutionsForModel(t2iModels[0].id);
+    if (useLiteLLM) return null;
+    const resolutions = getResolutionsForModel(effectiveT2i[0]?.id);
     return resolutions[0] || null;
   });
   const [selectedEffect, setSelectedEffect] = useState("");
   const [maxImages, setMaxImages] = useState(1);
+
+  useEffect(() => {
+    if (!useLiteLLM) return;
+    let cancelled = false;
+    fetchLiteLLMModels().then(models => {
+      if (!cancelled) {
+        setLiteLLMModels(models);
+        setLiteLLMModelsLoaded(true);
+        if (models.length > 0) {
+          const resolvedId = resolveLiteLLMModelId(selectedModelId, models, selectedModelName);
+          const resolvedModel = models.find((model) => model.id === resolvedId);
+          if (resolvedModel && selectedModelId !== resolvedModel.id) {
+            setSelectedModelId(resolvedModel.id);
+            setSelectedModelName(resolvedModel.name);
+          } else if (!resolvedModel) {
+            setSelectedModelId(models[0].id);
+            setSelectedModelName(models[0].name);
+          }
+        }
+      }
+    });
+    return () => { cancelled = true; };
+  }, [useLiteLLM, selectedModelId, selectedModelName]);
 
   // ── Prompt / upload state ───────────────────────────────────────────────
   const [prompt, setPrompt] = useState("");
@@ -913,19 +970,39 @@ export default function ImageStudio({
   }, [droppedFiles, onFilesHandled, processDroppedImages]);
 
   // ── Derived: current model lists & helpers ───────────────────────────────
-  const currentModels = imageMode ? i2iModels : t2iModels;
-  const currentAspectRatios = imageMode
-    ? getAspectRatiosForI2IModel(selectedModelId)
-    : getAspectRatiosForModel(selectedModelId);
-  const currentResolutions = imageMode
-    ? getResolutionsForI2IModel(selectedModelId)
-    : getResolutionsForModel(selectedModelId);
-  const currentQualityField = imageMode
-    ? getQualityFieldForI2IModel(selectedModelId)
-    : getQualityFieldForModel(selectedModelId);
-  const showQualityBtn = currentResolutions.length > 0;
-  const currentEffects = imageMode ? getEffectsForI2IModel(selectedModelId) : [];
+  const currentModels = imageMode ? effectiveI2i : effectiveT2i;
+  const selectedRequestModelId = useLiteLLM
+    ? resolveLiteLLMModelId(selectedModelId, currentModels, selectedModelName)
+    : selectedModelId;
+  const selectedLiteLLMModel = currentModels.find((model) => model.id === selectedRequestModelId);
+  const currentAspectRatios = useLiteLLM
+    ? getAspectRatiosForLiteLLMModel(selectedLiteLLMModel || selectedRequestModelId)
+    : (imageMode
+        ? getAspectRatiosForI2IModel(selectedModelId)
+        : getAspectRatiosForModel(selectedModelId));
+  const selectedRequestAspectRatio = getNearestAspectRatio(selectedAr, currentAspectRatios) || "1:1";
+  const selectedRequestSize = useLiteLLM
+    ? getSizeForLiteLLMModel(selectedLiteLLMModel || selectedRequestModelId, selectedRequestAspectRatio)
+    : null;
+  const currentResolutions = useLiteLLM
+    ? []
+    : (imageMode
+        ? getResolutionsForI2IModel(selectedModelId)
+        : getResolutionsForModel(selectedModelId));
+  const currentQualityField = useLiteLLM
+    ? null
+    : (imageMode
+        ? getQualityFieldForI2IModel(selectedModelId)
+        : getQualityFieldForModel(selectedModelId));
+  const showQualityBtn = useLiteLLM ? false : currentResolutions.length > 0;
+  const currentEffects = useLiteLLM ? [] : (imageMode ? getEffectsForI2IModel(selectedModelId) : []);
   const showEffectBtn = currentEffects.length > 0;
+
+  useEffect(() => {
+    if (currentAspectRatios.length > 0 && !currentAspectRatios.includes(selectedAr)) {
+      setSelectedAr(getNearestAspectRatio(selectedAr, currentAspectRatios));
+    }
+  }, [currentAspectRatios.join("|"), selectedAr]);
 
   // ── Textarea auto-resize ─────────────────────────────────────────────────
   const handleTextareaInput = () => {
@@ -943,17 +1020,17 @@ export default function ImageStudio({
       setUploadedImageUrls(newUrls);
 
       if (!imageMode) {
-        const firstI2I = i2iModels[0];
-        const ars = getAspectRatiosForI2IModel(firstI2I.id);
-        const resolutions = getResolutionsForI2IModel(firstI2I.id);
-        const effects = getEffectsForI2IModel(firstI2I.id);
+        const firstI2I = effectiveI2i[0];
+        const ars = useLiteLLM ? getAspectRatiosForLiteLLMModel(firstI2I) : getAspectRatiosForI2IModel(firstI2I.id);
+        const resolutions = useLiteLLM ? [] : getResolutionsForI2IModel(firstI2I.id);
+        const effects = useLiteLLM ? [] : getEffectsForI2IModel(firstI2I.id);
         setImageMode(true);
         setSelectedModelId(firstI2I.id);
         setSelectedModelName(firstI2I.name);
         setSelectedAr(ars[0] || "1:1");
         setSelectedQuality(resolutions[0] || null);
         setSelectedEffect(effects.length > 0 ? (getDefaultEffectForI2IModel(firstI2I.id) || effects[0]) : "");
-        setMaxImages(getMaxImagesForI2IModel(firstI2I.id));
+        setMaxImages(useLiteLLM ? 1 : getMaxImagesForI2IModel(firstI2I.id));
       }
     },
     [imageMode],
@@ -962,9 +1039,9 @@ export default function ImageStudio({
   const handleUploadClear = useCallback(() => {
     setUploadedImageUrls([]);
     setImageMode(false);
-    const firstT2I = t2iModels[0];
-    const ars = getAspectRatiosForModel(firstT2I.id);
-    const resolutions = getResolutionsForModel(firstT2I.id);
+    const firstT2I = effectiveT2i[0];
+    const ars = useLiteLLM ? getAspectRatiosForLiteLLMModel(firstT2I) : getAspectRatiosForModel(firstT2I.id);
+    const resolutions = useLiteLLM ? [] : getResolutionsForModel(firstT2I.id);
     setSelectedModelId(firstT2I.id);
     setSelectedModelName(firstT2I.name);
     setSelectedAr(ars[0] || "1:1");
@@ -975,19 +1052,23 @@ export default function ImageStudio({
 
   // ── Model selection ──────────────────────────────────────────────────────
   const handleModelSelect = (m) => {
-    const ars = imageMode
-      ? getAspectRatiosForI2IModel(m.id)
-      : getAspectRatiosForModel(m.id);
-    const resolutions = imageMode
-      ? getResolutionsForI2IModel(m.id)
-      : getResolutionsForModel(m.id);
+    const ars = useLiteLLM
+      ? getAspectRatiosForLiteLLMModel(m)
+      : (imageMode
+          ? getAspectRatiosForI2IModel(m.id)
+          : getAspectRatiosForModel(m.id));
+    const resolutions = useLiteLLM
+      ? []
+      : (imageMode
+          ? getResolutionsForI2IModel(m.id)
+          : getResolutionsForModel(m.id));
     setSelectedModelId(m.id);
     setSelectedModelName(m.name);
     setSelectedAr(ars[0] || "1:1");
     setSelectedQuality(resolutions[0] || null);
     if (imageMode) {
-      setMaxImages(getMaxImagesForI2IModel(m.id));
-      const effects = getEffectsForI2IModel(m.id);
+      setMaxImages(useLiteLLM ? 1 : getMaxImagesForI2IModel(m.id));
+      const effects = useLiteLLM ? [] : getEffectsForI2IModel(m.id);
       setSelectedEffect(effects.length > 0 ? (getDefaultEffectForI2IModel(m.id) || effects[0]) : "");
     } else {
       setSelectedEffect("");
@@ -1013,9 +1094,9 @@ export default function ImageStudio({
     setPrompt("");
     setUploadedImageUrls([]);
     setImageMode(false);
-    const firstT2I = t2iModels[0];
-    const ars = getAspectRatiosForModel(firstT2I.id);
-    const resolutions = getResolutionsForModel(firstT2I.id);
+    const firstT2I = effectiveT2i[0];
+    const ars = useLiteLLM ? getAspectRatiosForLiteLLMModel(firstT2I) : getAspectRatiosForModel(firstT2I.id);
+    const resolutions = useLiteLLM ? [] : getResolutionsForModel(firstT2I.id);
     setSelectedModelId(firstT2I.id);
     setSelectedModelName(firstT2I.name);
     setSelectedAr(ars[0] || "1:1");
@@ -1044,14 +1125,24 @@ export default function ImageStudio({
     setGenerateError(null);
 
     try {
+      if (
+        !selectedRequestModelId ||
+        selectedRequestModelId.startsWith("__") ||
+        (useLiteLLM && (!litellmModelsLoaded || !litellmModels.some((model) => model.id === selectedRequestModelId)))
+      ) {
+        alert("Please wait for LiteLLM models to load.");
+        return;
+      }
+
       const results = await Promise.all(
         Array.from({ length: batchSize }).map(async () => {
           if (imageMode) {
             const genParams = {
-              model: selectedModelId,
+              model: selectedRequestModelId,
               images_list: uploadedImageUrls,
               image_url: uploadedImageUrls[0],
-              aspect_ratio: selectedAr,
+              aspect_ratio: selectedRequestAspectRatio,
+              size: selectedRequestSize,
             };
             if (prompt.trim()) genParams.prompt = prompt.trim();
             if (currentQualityField && selectedQuality) {
@@ -1061,9 +1152,10 @@ export default function ImageStudio({
             return await generateI2I(apiKey, genParams);
           } else {
             const genParams = {
-              model: selectedModelId,
+              model: selectedRequestModelId,
               prompt: prompt.trim(),
-              aspect_ratio: selectedAr,
+              aspect_ratio: selectedRequestAspectRatio,
+              size: selectedRequestSize,
             };
             if (currentQualityField && selectedQuality) {
               genParams[currentQualityField] = selectedQuality;
@@ -1079,14 +1171,14 @@ export default function ImageStudio({
             id: res.id || Math.random().toString(36).substring(7),
             url: res.url,
             prompt: prompt.trim(),
-            model: selectedModelId,
-            aspect_ratio: selectedAr,
+            model: selectedRequestModelId,
+            aspect_ratio: selectedRequestAspectRatio,
             timestamp: new Date().toISOString(),
           };
           addToHistory(entry);
           onGenerationComplete?.({
             url: res.url,
-            model: selectedModelId,
+            model: selectedRequestModelId,
             prompt: prompt.trim(),
             type: "image",
           });
@@ -1098,6 +1190,8 @@ export default function ImageStudio({
       setTimeout(() => setGenerateError(null), 4000);
     } finally {
       setGenerating(false);
+      // Clear prompt after generation
+      setPrompt("");
     }
   };
 
@@ -1151,7 +1245,7 @@ export default function ImageStudio({
                     title="Download"
                     onClick={(e) => {
                       e.stopPropagation();
-                      downloadImage(entry.url, `muapi-${entry.id || idx}.jpg`);
+                      downloadImage(entry.url, `litellm-${entry.id || idx}.jpg`);
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-primary hover:text-black transition-all border border-white/10"
                   >

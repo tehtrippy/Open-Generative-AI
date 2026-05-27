@@ -1,15 +1,39 @@
-import { muapi } from '../lib/muapi.js';
+import { litellmApi } from '../lib/litellmApi.js';
 import {
     t2iModels, getAspectRatiosForModel, getResolutionsForModel, getQualityFieldForModel,
     i2iModels, getAspectRatiosForI2IModel, getResolutionsForI2IModel, getQualityFieldForI2IModel,
     getMaxImagesForI2IModel
 } from '../lib/models.js';
-import { localAI, isLocalAIAvailable } from '../lib/localInferenceClient.js';
-import { LOCAL_MODEL_CATALOG, getLocalModelById } from '../lib/localModels.js';
 import { ENHANCE_TAGS, QUICK_PROMPTS } from '../lib/promptUtils.js';
 import { AuthModal } from './AuthModal.js';
 import { createUploadPicker } from './UploadPicker.js';
 import { savePendingJob, removePendingJob, getPendingJobs } from '../lib/pendingJobs.js';
+import {
+    fetchLiteLLMModels,
+    getAspectRatiosForLiteLLMModel,
+    getSizeForLiteLLMModel,
+} from '../lib/litellmModels.js';
+
+const externalEngine = {
+    cancelGeneration() {},
+    onProgress() { return () => {}; },
+    async generate() { throw new Error('External engine generation is disabled.'); },
+};
+const isExternalEngineAvailable = () => false;
+const EXTERNAL_IMAGE_MODELS = [];
+const getExternalModelById = () => null;
+
+function getNearestAspectRatio(value, options) {
+    if (!options.length || options.includes(value)) return value;
+    const [w, h] = String(value || '').split(':').map(Number);
+    const orientation = !w || !h || w === h ? 'square' : (w > h ? 'landscape' : 'portrait');
+    const candidates = orientation === 'landscape'
+        ? ['3:2', '16:9', '4:3', '21:9', '1:1']
+        : orientation === 'portrait'
+            ? ['2:3', '9:16', '3:4', '1:1']
+            : ['1:1'];
+    return candidates.find((candidate) => options.includes(candidate)) || options[0];
+}
 
 function createInlineInstructions(type) {
     const el = document.createElement('div');
@@ -27,7 +51,9 @@ export function ImageStudio() {
     container.className = 'w-full h-full flex flex-col items-center justify-center bg-app-bg relative p-4 md:p-6 overflow-y-auto custom-scrollbar overflow-x-hidden';
 
     // --- State ---
-    const defaultModel = t2iModels[0];
+    const fallbackModel = { id: '__loading__', name: 'Loading LiteLLM models...', family: 'litellm', inputs: { aspect_ratio: { default: '1:1' } } };
+    let litellmModels = [fallbackModel];
+    const defaultModel = fallbackModel;
     let selectedModel = defaultModel.id;
     let selectedModelName = defaultModel.name;
     let selectedAr = defaultModel.inputs?.aspect_ratio?.default || '1:1';
@@ -35,13 +61,10 @@ export function ImageStudio() {
     let uploadedImageUrls = []; // array of uploaded image URLs (multi-image support)
     let imageMode = false; // false = t2i models, true = i2i models
 
-    // Local inference state — only image-capable models surface here.
-    // sd.cpp uses type='sd1'|'sdxl'|'z-image'; Wan2GP image models use type='image'.
-    // Wan2GP video models (type='video') are hidden from ImageStudio.
-    const LOCAL_IMAGE_MODELS = LOCAL_MODEL_CATALOG.filter(m => m.type !== 'video');
-    let useLocalModel = false;
-    let selectedLocalModel = LOCAL_IMAGE_MODELS[0]?.id || null;
-    let localGenProgress = 0; // 0–1
+    // External engine support is intentionally disabled; LiteLLM is the only runtime provider.
+    const availableExternalImageModels = EXTERNAL_IMAGE_MODELS;
+    let useExternalEngine = false;
+    let selectedExternalModel = availableExternalImageModels[0]?.id || null;
 
     // Advanced parameters state
     let negativePrompt = '';
@@ -62,10 +85,11 @@ export function ImageStudio() {
     // Quick tools panel state
     let showToolsPanel = false;
 
-    const getCurrentModels = () => imageMode ? i2iModels : t2iModels;
-    const getCurrentAspectRatios = (id) => imageMode ? getAspectRatiosForI2IModel(id) : getAspectRatiosForModel(id);
-    const getCurrentResolutions = (id) => imageMode ? getResolutionsForI2IModel(id) : getResolutionsForModel(id);
-    const getCurrentQualityField = (id) => imageMode ? getQualityFieldForI2IModel(id) : getQualityFieldForModel(id);
+    const getCurrentModels = () => litellmModels;
+    const getCurrentModel = (modelId = selectedModel) => litellmModels.find((model) => model.id === modelId) || modelId;
+    const getCurrentAspectRatios = (modelId = selectedModel) => getAspectRatiosForLiteLLMModel(getCurrentModel(modelId));
+    const getCurrentResolutions = () => [];
+    const getCurrentQualityField = () => null;
 
     // ==========================================
     // 1. HERO SECTION
@@ -112,21 +136,16 @@ export function ImageStudio() {
     // --- Image Upload Picker (Image-to-Image) ---
     const picker = createUploadPicker({
         anchorContainer: container,
-        uploadFn: (file) => useLocalModel ? URL.createObjectURL(file) : muapi.uploadFile(file),
-        requireApiKey: () => !useLocalModel,
+        uploadFn: (file) => useExternalEngine ? URL.createObjectURL(file) : litellmApi.uploadFile(file),
+        requireApiKey: () => !useExternalEngine,
         onSelect: ({ url, urls }) => {
             uploadedImageUrls = urls || [url];
             if (!imageMode) {
                 imageMode = true;
-                selectedModel = i2iModels[0].id;
-                selectedModelName = i2iModels[0].name;
-                selectedAr = getAspectRatiosForI2IModel(selectedModel)[0];
                 document.getElementById('model-btn-label').textContent = selectedModelName;
                 document.getElementById('ar-btn-label').textContent = selectedAr;
-                const validResolutions = getResolutionsForI2IModel(selectedModel);
-                qualityBtn.style.display = validResolutions.length > 0 ? 'flex' : 'none';
-                if (validResolutions.length > 0) document.getElementById('quality-btn-label').textContent = validResolutions[0];
-                picker.setMaxImages(getMaxImagesForI2IModel(selectedModel));
+                qualityBtn.style.display = 'none';
+                picker.setMaxImages(1);
             }
             textarea.placeholder = uploadedImageUrls.length > 1
                 ? `${uploadedImageUrls.length} images selected — describe the transformation (optional)`
@@ -135,14 +154,9 @@ export function ImageStudio() {
         onClear: () => {
             uploadedImageUrls = [];
             imageMode = false;
-            selectedModel = t2iModels[0].id;
-            selectedModelName = t2iModels[0].name;
-            selectedAr = getAspectRatiosForModel(selectedModel)[0];
             document.getElementById('model-btn-label').textContent = selectedModelName;
             document.getElementById('ar-btn-label').textContent = selectedAr;
-            const t2iResolutions = getResolutionsForModel(selectedModel);
-            qualityBtn.style.display = t2iResolutions.length > 0 ? 'flex' : 'none';
-            if (t2iResolutions.length > 0) document.getElementById('quality-btn-label').textContent = t2iResolutions[0];
+            qualityBtn.style.display = 'none';
             picker.setMaxImages(1);
             textarea.placeholder = 'Describe the image you want to create';
         }
@@ -197,16 +211,16 @@ export function ImageStudio() {
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="opacity-60 text-secondary"><path d="M6 2L3 6v15a2 2 0 002 2h14a2 2 0 002-2V6l-3-4H6z"/></svg>
     `, '720p', 'quality-btn', 'Set output quality');
 
-    // Local / API source toggle (only shown in Electron)
+    // External engine toggle remains disabled in LiteLLM-only mode.
     let localToggleBtn = null;
-    if (isLocalAIAvailable()) {
+    if (isExternalEngineAvailable()) {
         localToggleBtn = document.createElement('button');
         localToggleBtn.id = 'local-toggle-btn';
         localToggleBtn.className = 'flex items-center gap-1.5 px-3 py-2 rounded-xl transition-all border text-xs font-bold whitespace-nowrap';
         const updateLocalToggleStyle = () => {
-            if (useLocalModel) {
+            if (useExternalEngine) {
                 localToggleBtn.className = 'flex items-center gap-1.5 px-3 py-2 rounded-xl transition-all border text-xs font-bold whitespace-nowrap bg-primary/20 border-primary/40 text-primary';
-                localToggleBtn.textContent = '⚡ Local';
+                localToggleBtn.textContent = 'External';
             } else {
                 localToggleBtn.className = 'flex items-center gap-1.5 px-3 py-2 rounded-xl transition-all border text-xs font-bold whitespace-nowrap bg-white/5 border-white/5 text-white/60 hover:bg-white/10';
                 localToggleBtn.textContent = '☁ API';
@@ -215,11 +229,11 @@ export function ImageStudio() {
         updateLocalToggleStyle();
         localToggleBtn.onclick = (e) => {
             e.stopPropagation();
-            useLocalModel = !useLocalModel;
+            useExternalEngine = !useExternalEngine;
             updateLocalToggleStyle();
             // Reflect active model in the button label
-            if (useLocalModel) {
-                const lm = getLocalModelById(selectedLocalModel);
+            if (useExternalEngine) {
+                const lm = getExternalModelById(selectedExternalModel);
                 if (lm) document.getElementById('model-btn-label').textContent = lm.name;
             } else {
                 document.getElementById('model-btn-label').textContent = selectedModelName;
@@ -244,7 +258,7 @@ export function ImageStudio() {
     `, 'Tools', 'tools-btn', 'Quick starters & prompt enhancer');
     controlsLeft.appendChild(toolsBtn);
     // Show quality button if the default model has quality/resolution options
-    const _initResolutions = getResolutionsForModel(defaultModel.id);
+    const _initResolutions = getCurrentResolutions(defaultModel.id);
     qualityBtn.style.display = _initResolutions.length > 0 ? 'flex' : 'none';
     if (_initResolutions.length > 0) {
         const qlabel = qualityBtn.querySelector('#quality-btn-label');
@@ -262,17 +276,32 @@ export function ImageStudio() {
     promptWrapper.appendChild(bar);
     container.appendChild(promptWrapper);
 
+    fetchLiteLLMModels().then((models) => {
+        litellmModels = models.length ? models : [{ ...fallbackModel, name: 'No LiteLLM models found' }];
+        if (litellmModels[0]?.id && litellmModels[0].id !== '__loading__') {
+            selectedModel = litellmModels[0].id;
+            selectedModelName = litellmModels[0].name;
+            selectedAr = getCurrentAspectRatios(selectedModel)[0] || '1:1';
+            document.getElementById('model-btn-label').textContent = selectedModelName;
+            document.getElementById('ar-btn-label').textContent = selectedAr;
+        }
+    }).catch((error) => {
+        console.error('[ImageStudio] LiteLLM model load failed:', error);
+        litellmModels = [{ id: '__error__', name: 'Model load failed', family: 'litellm', inputs: { aspect_ratio: { default: '1:1' } } }];
+        document.getElementById('model-btn-label').textContent = 'Model load failed';
+    });
+
     const inlineInstructions = createInlineInstructions('image');
     inlineInstructions.classList.add('max-w-4xl', 'mt-8');
     container.appendChild(inlineInstructions);
 
-    // Local generation progress bar (hidden until active)
+    // external generation progress bar (hidden until active)
     const localProgressWrap = document.createElement('div');
     localProgressWrap.className = 'w-full max-w-4xl mt-4 hidden flex-col gap-2';
     localProgressWrap.id = 'local-progress-wrap';
     localProgressWrap.innerHTML = `
         <div class="flex items-center justify-between">
-            <span class="text-xs font-bold text-white/60">Generating locally...</span>
+            <span class="text-xs font-bold text-white/60">Generating...</span>
             <span id="local-progress-pct" class="text-xs font-bold text-primary">0%</span>
         </div>
         <div class="h-1.5 rounded-full bg-white/10 overflow-hidden">
@@ -285,7 +314,7 @@ export function ImageStudio() {
     container.appendChild(localProgressWrap);
 
     localProgressWrap.querySelector('#local-cancel-btn')?.addEventListener('click', () => {
-        localAI.cancelGeneration();
+        externalEngine.cancelGeneration();
         localProgressWrap.classList.remove('flex');
         localProgressWrap.classList.add('hidden');
         generateBtn.disabled = false;
@@ -732,19 +761,19 @@ export function ImageStudio() {
             const renderModels = (filter = '') => {
                 list.innerHTML = '';
 
-                if (useLocalModel) {
-                    // ── Local model list (Wan2GP image-capable models only) ───
-                    const filtered = LOCAL_IMAGE_MODELS.filter(m =>
+                if (useExternalEngine) {
+                    // External model list is disabled in LiteLLM-only mode.
+                    const filtered = EXTERNAL_IMAGE_MODELS.filter(m =>
                         m.name.toLowerCase().includes(filter.toLowerCase()) ||
                         m.id.toLowerCase().includes(filter.toLowerCase())
                     );
                     if (filtered.length === 0) {
-                        list.innerHTML = `<div class="text-xs text-muted text-center py-4">No local models match</div>`;
+                        list.innerHTML = `<div class="text-xs text-muted text-center py-4">No gateway models match</div>`;
                         return;
                     }
                     filtered.forEach(m => {
                         const item = document.createElement('div');
-                        item.className = `flex items-center justify-between p-3.5 hover:bg-white/5 rounded-2xl cursor-pointer transition-all border border-transparent hover:border-white/5 ${selectedLocalModel === m.id ? 'bg-white/5 border-white/5' : ''}`;
+                        item.className = `flex items-center justify-between p-3.5 hover:bg-white/5 rounded-2xl cursor-pointer transition-all border border-transparent hover:border-white/5 ${selectedExternalModel === m.id ? 'bg-white/5 border-white/5' : ''}`;
                         item.innerHTML = `
                             <div class="flex items-center gap-3.5">
                                 <div class="w-10 h-10 ${m.featured ? 'bg-primary/10 text-primary' : 'bg-green-500/10 text-green-400'} border border-white/5 rounded-xl flex items-center justify-center font-black text-sm shadow-inner uppercase">${m.featured ? '⚡' : m.name.charAt(0)}</div>
@@ -756,11 +785,11 @@ export function ImageStudio() {
                                     <span class="text-[10px] text-muted">${m.type.toUpperCase()} · ${m.family}</span>
                                 </div>
                             </div>
-                            ${selectedLocalModel === m.id ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="4"><polyline points="20 6 9 17 4 12"/></svg>' : ''}
+                            ${selectedExternalModel === m.id ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="4"><polyline points="20 6 9 17 4 12"/></svg>' : ''}
                         `;
                         item.onclick = (e) => {
                             e.stopPropagation();
-                            selectedLocalModel = m.id;
+                            selectedExternalModel = m.id;
                             document.getElementById('model-btn-label').textContent = m.name;
                             selectedAr = m.aspectRatios[0];
                             document.getElementById('ar-btn-label').textContent = selectedAr;
@@ -802,9 +831,8 @@ export function ImageStudio() {
                             document.getElementById('quality-btn-label').textContent = validResolutions[0];
                         }
 
-                        // Update picker's max images when switching i2i models
                         if (imageMode) {
-                            picker.setMaxImages(getMaxImagesForI2IModel(selectedModel));
+                            picker.setMaxImages(1);
                         }
 
                         closeDropdown();
@@ -1003,7 +1031,7 @@ export function ImageStudio() {
         generationHistory.unshift(entry);
 
         // Save to localStorage
-        localStorage.setItem('muapi_history', JSON.stringify(generationHistory.slice(0, 50)));
+        localStorage.setItem('litellm_history', JSON.stringify(generationHistory.slice(0, 50)));
 
         // Show sidebar
         historySidebar.classList.remove('translate-x-full', 'opacity-0');
@@ -1029,7 +1057,7 @@ export function ImageStudio() {
 
             thumb.onclick = (e) => {
                 if (e.target.closest('.hist-download')) {
-                    downloadImage(entry.url, `muapi-${entry.id || idx}.jpg`);
+                    downloadImage(entry.url, `litellm-${entry.id || idx}.jpg`);
                     return;
                 }
                 showImageInCanvas(entry.url);
@@ -1067,7 +1095,7 @@ export function ImageStudio() {
 
     // --- Load history from localStorage ---
     try {
-        const saved = JSON.parse(localStorage.getItem('muapi_history') || '[]');
+        const saved = JSON.parse(localStorage.getItem('litellm_history') || '[]');
         if (saved.length > 0) {
             saved.forEach(e => generationHistory.push(e));
             historySidebar.classList.remove('translate-x-full', 'opacity-0');
@@ -1081,7 +1109,7 @@ export function ImageStudio() {
         const pending = getPendingJobs('image');
         if (!pending.length) return;
 
-        const apiKey = localStorage.getItem('muapi_key');
+        const apiKey = localStorage.getItem('litellm_key');
         if (!apiKey) return; // can't poll without key; jobs remain for next time
 
         const banner = document.createElement('div');
@@ -1094,7 +1122,7 @@ export function ImageStudio() {
             const elapsedAttempts = Math.floor((Date.now() - job.submittedAt) / job.interval);
             const attemptsLeft = Math.max(1, job.maxAttempts - elapsedAttempts);
             try {
-                const result = await muapi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
+                const result = await litellmApi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
                 const url = result.outputs?.[0] || result.url || result.output?.url;
                 if (url) {
                     addToHistory({ id: job.requestId, url, ...job.historyMeta, timestamp: new Date().toISOString() });
@@ -1115,7 +1143,7 @@ export function ImageStudio() {
         const current = resultImg.src;
         if (current) {
             const entry = generationHistory.find(e => e.url === current);
-            downloadImage(current, `muapi-${entry?.id || 'image'}.jpg`);
+            downloadImage(current, `litellm-${entry?.id || 'image'}.jpg`);
         }
     };
 
@@ -1138,14 +1166,13 @@ export function ImageStudio() {
         picker.setMaxImages(1);
         // Reset to t2i mode
         imageMode = false;
-        selectedModel = t2iModels[0].id;
-        selectedModelName = t2iModels[0].name;
-        selectedAr = getAspectRatiosForModel(selectedModel)[0];
+        const firstModel = getCurrentModels()[0] || fallbackModel;
+        selectedModel = firstModel.id;
+        selectedModelName = firstModel.name;
+        selectedAr = getCurrentAspectRatios(selectedModel)[0] || '1:1';
         document.getElementById('model-btn-label').textContent = selectedModelName;
         document.getElementById('ar-btn-label').textContent = selectedAr;
-        const resetResolutions = getResolutionsForModel(selectedModel);
-        qualityBtn.style.display = resetResolutions.length > 0 ? 'flex' : 'none';
-        if (resetResolutions.length > 0) document.getElementById('quality-btn-label').textContent = resetResolutions[0];
+        qualityBtn.style.display = 'none';
         textarea.placeholder = 'Describe the image you want to create';
         textarea.focus();
     };
@@ -1167,10 +1194,10 @@ export function ImageStudio() {
             }
         }
 
-        // ── Local inference path ──────────────────────────────────────────────
-        if (useLocalModel) {
-            const lm = getLocalModelById(selectedLocalModel);
-            if (!lm) { alert('No local model selected.'); return; }
+        // ── External engine path ──────────────────────────────────────────────
+        if (useExternalEngine) {
+            const lm = getExternalModelById(selectedExternalModel);
+            if (!lm) { alert('No external model selected.'); return; }
 
             hero.classList.add('opacity-0', 'scale-95', '-translate-y-10', 'pointer-events-none');
             generateBtn.disabled = true;
@@ -1182,7 +1209,7 @@ export function ImageStudio() {
             progressWrap.classList.remove('hidden');
             progressWrap.classList.add('flex');
 
-            const unsub = localAI.onProgress(({ progress, status }) => {
+            const unsub = externalEngine.onProgress(({ progress, status }) => {
                 const pct = Math.round((progress ?? 0) * 100);
                 if (progressFill) progressFill.style.width = `${pct}%`;
                 if (progressPct) progressPct.textContent = status === 'starting' ? 'Starting...' : `${pct}%`;
@@ -1191,8 +1218,8 @@ export function ImageStudio() {
 
             let hadError = false;
             try {
-                const res = await localAI.generate({
-                    model: selectedLocalModel,
+                const res = await externalEngine.generate({
+                    model: selectedExternalModel,
                     prompt,
                     negative_prompt: negativePrompt || undefined,
                     aspect_ratio: selectedAr,
@@ -1204,7 +1231,7 @@ export function ImageStudio() {
                 progressWrap.classList.replace('flex', 'hidden');
                 progressWrap.classList.add('hidden');
 
-                if (!res?.url) throw new Error('No output returned from local generation');
+                if (!res?.url) throw new Error('No output returned from external generation');
                 if (res.mediaType === 'video') {
                     throw new Error('This model produces video — use the Video studio instead.');
                 }
@@ -1212,7 +1239,7 @@ export function ImageStudio() {
                     id: Date.now().toString(),
                     url: res.url,
                     prompt,
-                    model: `local:${selectedLocalModel}`,
+                    model: `external:${selectedExternalModel}`,
                     aspect_ratio: selectedAr,
                     seed: res.seed,
                     timestamp: new Date().toISOString()
@@ -1222,9 +1249,9 @@ export function ImageStudio() {
                 hadError = true;
                 unsub();
                 progressWrap.classList.add('hidden');
-                console.error('[Local] generation error:', e);
+                console.error('[External] generation error:', e);
                 hero.classList.remove('opacity-0', 'scale-95', '-translate-y-10', 'pointer-events-none');
-                console.error('[Local] full error:', e.message);
+                console.error('[External] full error:', e.message);
                 generateBtn.innerHTML = `Error: ${e.message.slice(0, 120)}`;
                 setTimeout(() => { generateBtn.innerHTML = `Generate ✨`; }, 6000);
             } finally {
@@ -1234,10 +1261,15 @@ export function ImageStudio() {
             return;
         }
 
-        // ── Remote API path ───────────────────────────────────────────────────
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) {
+        // ── LiteLLM gateway path ───────────────────────────────────────────────────
+        const apiKey = localStorage.getItem('litellm_key');
+        const apiUrl = localStorage.getItem('litellm_url');
+        if (!apiKey || !apiUrl) {
             AuthModal(() => generateBtn.click());
+            return;
+        }
+        if (!selectedModel || selectedModel.startsWith('__')) {
+            alert('Please wait for LiteLLM models to load.');
             return;
         }
 
@@ -1247,6 +1279,12 @@ export function ImageStudio() {
 
         let hadError = false;
         let capturedRequestId = null;
+        const availableArs = getCurrentAspectRatios(selectedModel);
+        if (!availableArs.includes(selectedAr)) {
+            selectedAr = getNearestAspectRatio(selectedAr, availableArs) || '1:1';
+            document.getElementById('ar-btn-label').textContent = selectedAr;
+        }
+        const selectedSize = getSizeForLiteLLMModel(getCurrentModel(selectedModel), selectedAr);
         const historyMeta = { prompt, model: selectedModel, aspect_ratio: selectedAr };
 
         try {
@@ -1258,6 +1296,7 @@ export function ImageStudio() {
                     images_list: uploadedImageUrls,
                     image_url: uploadedImageUrls[0], // backward compat for single-image models
                     aspect_ratio: selectedAr,
+                    size: selectedSize,
                     onRequestId: (rid) => {
                         capturedRequestId = rid;
                         savePendingJob({ requestId: rid, studioType: 'image', historyMeta, maxAttempts: 60, interval: 2000, submittedAt: Date.now() });
@@ -1266,12 +1305,13 @@ export function ImageStudio() {
                 if (prompt) genParams.prompt = prompt;
                 const qualityField = getCurrentQualityField(selectedModel);
                 if (qualityField && qualityLabel) genParams[qualityField] = qualityLabel;
-                res = await muapi.generateI2I(genParams);
+                res = await litellmApi.generateI2I(genParams);
             } else {
                 const genParams = {
                     model: selectedModel,
                     prompt,
                     aspect_ratio: selectedAr,
+                    size: selectedSize,
                     onRequestId: (rid) => {
                         capturedRequestId = rid;
                         savePendingJob({ requestId: rid, studioType: 'image', historyMeta, maxAttempts: 60, interval: 2000, submittedAt: Date.now() });
@@ -1279,7 +1319,7 @@ export function ImageStudio() {
                 };
                 const qualityField = getCurrentQualityField(selectedModel);
                 if (qualityField && qualityLabel) genParams[qualityField] = qualityLabel;
-                res = await muapi.generateImage(genParams);
+                res = await litellmApi.generateImage(genParams);
             }
 
             console.log('[ImageStudio] Full response:', res);

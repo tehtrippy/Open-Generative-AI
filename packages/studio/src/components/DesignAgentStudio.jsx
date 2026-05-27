@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { CreativeCanvas } from 'design-agent';
 import 'design-agent/dist/tailwind.css';
-import { getUserBalance } from '../muapi';
+import { getUserBalance } from '../litellmApi';
 
 export default function DesignAgentStudio({ apiKey, isHeaderVisible, onToggleHeader }) {
   const [userData, setUserData] = useState(null);

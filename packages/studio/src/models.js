@@ -754,7 +754,7 @@ export const t2iModels = [
     "inputs": {
       "prompt": {
         "examples": [
-          "A retro 80s style poster with the words 'MUAPI APP' glowing in pink and blue neon lights, cyberpunk city skyline in the background, cinematic design, highly detailed."
+          "A retro 80s style poster with the words 'AI APP' glowing in pink and blue neon lights, cyberpunk city skyline in the background, cinematic design, highly detailed."
         ],
         "description": "Text prompt describing the image.",
         "type": "string",
@@ -5118,7 +5118,7 @@ export const i2vModels = [
         "name": "prompt",
         "description": "Text prompt describing the desired video content.",
         "examples": [
-          "On a neon-lit street corner, a hyped street performer with a mic shouts: 'Yo! Big drop today! VEO3 just launched on muapi!' A crowd cheers as holograms of videos burst into the air and the muapi logo spins above."
+          "On a neon-lit street corner, a hyped street performer with a mic shouts: 'Yo! Big drop today! VEO3 just launched through LiteLLM!' A crowd cheers as holograms of videos burst into the air."
         ]
       },
       "aspect_ratio": {
@@ -6425,7 +6425,7 @@ export const i2vModels = [
         "name": "prompt",
         "description": "Text prompt describing the video.",
         "examples": [
-          "Scene: Giant floating library orbiting in zero-gravity space.\nCharacters: Astronaut-librarian flipping glowing pages suspended midair.\nAction: Camera rotates 360° around drifting books → zooms through a floating page into a nebula outside window.\nCamera: Orbit + push-through transition.\nLighting: Cool cosmic ambient with warm page glows; rim lighting on suit.\nMotion: Slow rotational drift; pages react with fluid inertia.\nAudio: Ethereal synth pads + book rustle in vacuum hush.\nMood: Awe, wonder, intellectual calm.\nLine: “Wow veo3.1 launched in Muapiapp. Let's go!”"
+          "Scene: Giant floating library orbiting in zero-gravity space.\nCharacters: Astronaut-librarian flipping glowing pages suspended midair.\nAction: Camera rotates 360° around drifting books → zooms through a floating page into a nebula outside window.\nCamera: Orbit + push-through transition.\nLighting: Cool cosmic ambient with warm page glows; rim lighting on suit.\nMotion: Slow rotational drift; pages react with fluid inertia.\nAudio: Ethereal synth pads + book rustle in vacuum hush.\nMood: Awe, wonder, intellectual calm.\nLine: “Wow veo3.1 launched in Open Generative AI. Let's go!”"
         ]
       },
       "aspect_ratio": {

@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { generateVideo, generateI2V, processV2V, uploadFile } from "../muapi.js";
+import { generateVideo, generateI2V, processV2V, uploadFile } from "../litellmApi.js";
+import { fetchLiteLLMModels, getDefaultAspectRatios, resolveLiteLLMModelId } from "../litellmModels.js";
+import { videoModels as byteplusModels, byteplusGenerateVideo, hasBytePlusCredentials } from "../byteplus.js";
 import {
   t2vModels,
   i2vModels,
@@ -103,18 +105,18 @@ function DropdownItem({ label, selected, onClick }) {
   );
 }
 
-function ModelDropdown({ imageMode, selectedModel, onSelect, onClose }) {
+function ModelDropdown({ imageMode, selectedModel, onSelect, onClose, models }) {
   const [search, setSearch] = useState("");
 
-  const generationModels = imageMode ? i2vModels : t2vModels;
+  const generationModels = models?.length ? models : (imageMode ? i2vModels : t2vModels);
 
   const lf = search.toLowerCase();
-  const filteredMain = generationModels.filter(
+  const filteredAll = generationModels.filter(
     (m) => m.name.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf),
   );
-  const filteredV2V = v2vModels.filter(
-    (m) => m.name.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf),
-  );
+  const filteredBp = filteredAll.filter((m) => m.provider === "byteplus");
+  const filteredMain = filteredAll.filter((m) => m.provider !== "byteplus");
+  const filteredV2V = [];
 
   const getIconColor = (m, isV2V) => {
     if (isV2V) return "bg-orange-500/10 text-orange-400";
@@ -185,7 +187,24 @@ function ModelDropdown({ imageMode, selectedModel, onSelect, onClose }) {
         Video models
       </div>
       <div className="flex flex-col gap-1.5 overflow-y-auto custom-scrollbar pr-1 pb-2">
-        {filteredMain.map((m) => renderItem(m, false))}
+        {filteredBp.length > 0 && (
+          <>
+            <div className="text-xs font-bold text-cyan-400/70 px-3 py-2 shrink-0">
+              BytePlus Models
+            </div>
+            {filteredBp.map((m) => renderItem(m, false))}
+          </>
+        )}
+        {filteredMain.length > 0 && (
+          <>
+            {filteredBp.length > 0 && (
+              <div className="text-xs font-bold text-white/30 px-3 py-2 mt-1 border-t border-white/5">
+                LiteLLM Models
+              </div>
+            )}
+            {filteredMain.map((m) => renderItem(m, false))}
+          </>
+        )}
         {filteredV2V.length > 0 && (
           <>
             <div className="text-xs font-bold text-orange-400/70 px-3 py-2 mt-1 border-t border-white/5">
@@ -241,13 +260,16 @@ export default function VideoStudio({
   onFilesHandled,
 }) {
   const PERSIST_KEY = "hg_video_studio_persistent";
+  const fallbackModel = { id: "__loading__", name: "Loading models..." };
+  const [litellmModels, setLiteLLMModels] = useState([]);
 
   // ── mode state ──
   const [imageMode, setImageMode] = useState(false); // i2v
   const [v2vMode, setV2vMode] = useState(false);
 
   // ── model / params ──
-  const defaultModel = t2vModels[0];
+  const defaultBpModel = byteplusModels.find((m) => m.isDefault) || byteplusModels[0];
+  const defaultModel = litellmModels[0] || defaultBpModel || fallbackModel;
   const [selectedModel, setSelectedModel] = useState(defaultModel.id);
   const [selectedModelName, setSelectedModelName] = useState(defaultModel.name);
   const [selectedAr, setSelectedAr] = useState(
@@ -318,34 +340,82 @@ export default function VideoStudio({
   const resultVideoRef = useRef(null);
   const hasRestored = useRef(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetchLiteLLMModels().then((models) => {
+      if (cancelled) return;
+      setLiteLLMModels(models);
+      // Don't override if a BytePlus model is already selected
+      const isBpSelected = byteplusModels.some((m) => m.id === selectedModel);
+      if (isBpSelected) return;
+      if (models.length > 0) {
+        const resolvedId = resolveLiteLLMModelId(selectedModel, models, selectedModelName);
+        const resolvedModel = models.find((model) => model.id === resolvedId);
+        if (resolvedModel && selectedModel !== resolvedModel.id) {
+          setSelectedModel(resolvedModel.id);
+          setSelectedModelName(resolvedModel.name);
+        } else if (!resolvedModel) {
+          // Default to first BytePlus model if available, else first LiteLLM model
+          const defaultBp = byteplusModels.find((m) => m.isDefault) || byteplusModels[0];
+          if (defaultBp) {
+            setSelectedModel(defaultBp.id);
+            setSelectedModelName(defaultBp.name);
+          } else {
+            setSelectedModel(models[0].id);
+            setSelectedModelName(models[0].name);
+          }
+        }
+      } else {
+        // No LiteLLM models — default to BytePlus
+        const defaultBp = byteplusModels.find((m) => m.isDefault) || byteplusModels[0];
+        if (defaultBp) {
+          setSelectedModel(defaultBp.id);
+          setSelectedModelName(defaultBp.name);
+        }
+      }
+    });
+    return () => { cancelled = true; };
+  }, [selectedModel, selectedModelName]);
+
   // ── derived data ──
   const history = historyItems ?? localHistory;
 
   const getCurrentModels = useCallback(() => {
-    if (v2vMode) return v2vModels;
-    return imageMode ? i2vModels : t2vModels;
-  }, [imageMode, v2vMode]);
+    const llm = litellmModels.length ? litellmModels : [fallbackModel];
+    return [...byteplusModels, ...llm];
+  }, [litellmModels]);
+  const selectedRequestModel = resolveLiteLLMModelId(selectedModel, getCurrentModels(), selectedModelName);
 
   const getCurrentAspectRatios = useCallback(
-    (id) =>
-      imageMode
-        ? getAspectRatiosForI2VModel(id)
-        : getAspectRatiosForVideoModel(id),
-    [imageMode],
+    (modelId) => {
+      const m = getCurrentModels().find((x) => x.id === modelId);
+      if (m?.inputs?.aspect_ratio?.enum) return m.inputs.aspect_ratio.enum;
+      return getDefaultAspectRatios();
+    },
+    [getCurrentModels],
   );
 
   const getCurrentDurations = useCallback(
-    (id) =>
-      imageMode ? getDurationsForI2VModel(id) : getDurationsForModel(id),
-    [imageMode],
+    (modelId) => {
+      const m = getCurrentModels().find((x) => x.id === modelId);
+      if (m?.inputs?.duration) {
+        const d = m.inputs.duration;
+        const result = [];
+        for (let i = d.minValue || d.default || 2; i <= (d.maxValue || 10); i += (d.step || 1)) result.push(i);
+        return result.length ? result : [d.default || 5];
+      }
+      return [5, 10];
+    },
+    [getCurrentModels],
   );
 
   const getCurrentResolutions = useCallback(
-    (id) =>
-      imageMode
-        ? getResolutionsForI2VModel(id)
-        : getResolutionsForVideoModel(id),
-    [imageMode],
+    (modelId) => {
+      const m = getCurrentModels().find((x) => x.id === modelId);
+      if (m?.inputs?.resolution?.enum) return m.inputs.resolution.enum;
+      return [];
+    },
+    [getCurrentModels],
   );
 
   const getCurrentModel = useCallback(
@@ -375,65 +445,18 @@ export default function VideoStudio({
         return;
       }
 
-      const modelList = isImageMode ? i2vModels : t2vModels;
-      const model = modelList.find((m) => m.id === modelId);
-
-      const ars = isImageMode
-        ? getAspectRatiosForI2VModel(modelId)
-        : getAspectRatiosForVideoModel(modelId);
-      if (ars.length > 0) {
-        setSelectedAr(ars[0]);
-        setShowAr(true);
-      } else {
-        setShowAr(false);
-      }
-
-      const durations = isImageMode
-        ? getDurationsForI2VModel(modelId)
-        : getDurationsForModel(modelId);
-      if (durations.length > 0) {
-        setSelectedDuration(durations[0]);
-        setShowDuration(true);
-      } else {
-        setShowDuration(false);
-      }
-
-      const resolutions = isImageMode
-        ? getResolutionsForI2VModel(modelId)
-        : getResolutionsForVideoModel(modelId);
-      if (resolutions.length > 0) {
-        setSelectedResolution(resolutions[0]);
-        setShowResolution(true);
-      } else {
-        setShowResolution(false);
-      }
-
-      const qualities = getQualitiesForModel(modelList, modelId);
-      if (qualities.length > 0) {
-        setSelectedQuality(model?.inputs?.quality?.default || qualities[0]);
-        setShowQuality(true);
-      } else {
-        setSelectedQuality("");
-        setShowQuality(false);
-      }
-
-      const modes = getModesForModel(modelId);
-      if (modes.length > 0) {
-        setSelectedMode(model?.inputs?.mode?.default || modes[0]);
-        setShowMode(true);
-      } else {
-        setSelectedMode("");
-        setShowMode(false);
-      }
-
-      const effects = isImageMode ? getEffectsForI2VModel(modelId) : [];
-      if (effects.length > 0) {
-        setSelectedEffect(getDefaultEffectForI2VModel(modelId) || effects[0]);
-        setShowEffect(true);
-      } else {
-        setSelectedEffect("");
-        setShowEffect(false);
-      }
+      setSelectedAr(getDefaultAspectRatios()[0]);
+      setSelectedDuration(5);
+      setSelectedResolution("");
+      setSelectedQuality("");
+      setSelectedMode("");
+      setSelectedEffect("");
+      setShowAr(true);
+      setShowDuration(true);
+      setShowResolution(false);
+      setShowQuality(false);
+      setShowMode(false);
+      setShowEffect(false);
     },
     [],
   );
@@ -550,11 +573,7 @@ export default function VideoStudio({
       setUploadedVideoName(null);
       setV2vMode(false);
       if (!imageMode) {
-        const currentT2V = t2vModels.find((m) => m.id === selectedModel);
-        const sibling = currentT2V?.family
-          ? i2vModels.find((m) => m.family === currentT2V.family)
-          : null;
-        const target = sibling || i2vModels[0];
+        const target = getCurrentModels().find((m) => m.id === selectedModel) || getCurrentModels()[0];
         setImageMode(true);
         setSelectedModel(target.id);
         setSelectedModelName(target.name);
@@ -587,7 +606,7 @@ export default function VideoStudio({
         setImageMode(false);
       }
       setV2vMode(true);
-      const firstV2V = v2vModels[0];
+      const firstV2V = getCurrentModels().find((m) => m.id === selectedModel) || getCurrentModels()[0];
       setSelectedModel(firstV2V.id);
       setSelectedModelName(firstV2V.name);
       applyControlsForModel(firstV2V.id, false, true);
@@ -671,11 +690,7 @@ export default function VideoStudio({
         setV2vMode(false);
 
         if (!imageMode) {
-          const currentT2V = t2vModels.find((m) => m.id === selectedModel);
-          const sibling = currentT2V?.family
-            ? i2vModels.find((m) => m.family === currentT2V.family)
-            : null;
-          const target = sibling || i2vModels[0];
+          const target = getCurrentModels().find((m) => m.id === selectedModel) || getCurrentModels()[0];
           setImageMode(true);
           setSelectedModel(target.id);
           setSelectedModelName(target.name);
@@ -699,7 +714,7 @@ export default function VideoStudio({
     // Motion-control v2v: keep model and video; just drop the image
     if (isMotionControlSelection(selectedModel, v2vMode)) return;
     setImageMode(false);
-    const first = t2vModels[0];
+    const first = getCurrentModels()[0];
     setSelectedModel(first.id);
     setSelectedModelName(first.name);
     applyControlsForModel(first.id, false, false);
@@ -759,7 +774,7 @@ export default function VideoStudio({
           setImageMode(false);
         }
         setV2vMode(true);
-        const firstV2V = v2vModels[0];
+        const firstV2V = getCurrentModels().find((m) => m.id === selectedModel) || getCurrentModels()[0];
         setSelectedModel(firstV2V.id);
         setSelectedModelName(firstV2V.name);
         applyControlsForModel(firstV2V.id, false, true);
@@ -780,7 +795,7 @@ export default function VideoStudio({
     setUploadedVideoUrl(null);
     setUploadedVideoName(null);
     setV2vMode(false);
-    const first = t2vModels[0];
+    const first = getCurrentModels()[0];
     setSelectedModel(first.id);
     setSelectedModelName(first.name);
     applyControlsForModel(first.id, false, false);
@@ -797,7 +812,6 @@ export default function VideoStudio({
         if (!isMC) {
           // Single-input v2v (watermark remover etc.) — drop any image
           setUploadedImageUrl(null);
-          setUploadedImagePreview(null);
         }
         setSelectedModel(m.id);
         setSelectedModelName(m.name);
@@ -843,6 +857,8 @@ export default function VideoStudio({
     const isExtendMode = currentModel?.requiresRequestId;
     const trimmedPrompt = prompt.trim();
 
+    const isBytePlus = currentModel?.provider === "byteplus";
+
     if (v2vMode) {
       if (!uploadedVideoUrl) {
         alert("Please upload a video first.");
@@ -875,6 +891,20 @@ export default function VideoStudio({
       }
     }
 
+    if (isBytePlus) {
+      if (!hasBytePlusCredentials()) {
+        alert("BytePlus API Key missing. Add it in Settings or the Auth modal.");
+        return;
+      }
+    } else if (
+      !selectedRequestModel ||
+      selectedRequestModel.startsWith("__") ||
+      !litellmModels.some((model) => model.id === selectedRequestModel)
+    ) {
+      alert("Please wait for LiteLLM models to load.");
+      return;
+    }
+
     setGenerating(true);
     setGenerateError(null);
 
@@ -883,11 +913,39 @@ export default function VideoStudio({
     try {
       let res;
 
+      // BytePlus direct generation
+      if (isBytePlus) {
+        const bpModel = byteplusModels.find((m) => m.id === selectedModel);
+        if (bpModel?.type === "i2v" && !uploadedImageUrl) {
+          throw new Error("This model requires a start frame image. Upload an image first.");
+        }
+        const bpOptions = { resolution: selectedResolution, duration: selectedDuration, ratio: selectedAr };
+        const bpImageUrl = uploadedImageUrl || null;
+        const bpResult = await byteplusGenerateVideo(selectedModel, trimmedPrompt || "", bpOptions, bpImageUrl);
+        if (!bpResult?.url) throw new Error("No video URL returned by BytePlus");
+
+        const genId = bpResult.taskId || Date.now().toString();
+        const entry = {
+          id: genId,
+          url: bpResult.url,
+          prompt: trimmedPrompt,
+          model: selectedModel,
+          aspect_ratio: selectedAr,
+          duration: selectedDuration,
+          timestamp: new Date().toISOString(),
+        };
+        addToLocalHistory(entry);
+        showVideoInCanvas(bpResult.url, selectedModel);
+        if (onGenerationComplete) onGenerationComplete({ url: bpResult.url, model: selectedModel, prompt: trimmedPrompt, type: "video" });
+        setGenerating(false);
+        return;
+      }
+
       if (v2vMode) {
         // V2V: dedicated processV2V handles single-input tools (e.g. watermark
         // remover) and motion-control models (which take video + image + prompt)
         const v2vParams = {
-          model: selectedModel,
+          model: selectedRequestModel,
           video_url: uploadedVideoUrl,
         };
         if (currentModel?.imageField && uploadedImageUrl) {
@@ -906,20 +964,20 @@ export default function VideoStudio({
           id: genId,
           url: res.url,
           prompt: currentModel?.hasPrompt ? trimmedPrompt : "",
-          model: selectedModel,
+          model: selectedRequestModel,
           timestamp: new Date().toISOString(),
         };
         addToLocalHistory(entry);
-        showVideoInCanvas(res.url, selectedModel);
+        showVideoInCanvas(res.url, selectedRequestModel);
         if (onGenerationComplete)
           onGenerationComplete({
             url: res.url,
-            model: selectedModel,
+            model: selectedRequestModel,
             prompt: currentModel?.hasPrompt ? trimmedPrompt : "",
             type: "video",
           });
       } else if (imageMode) {
-        const i2vParams = { model: selectedModel, image_url: uploadedImageUrl };
+        const i2vParams = { model: selectedRequestModel, image_url: uploadedImageUrl };
         if (trimmedPrompt) i2vParams.prompt = trimmedPrompt;
         i2vParams.aspect_ratio = selectedAr;
         const i2vModel = i2vModels.find((m) => m.id === selectedModel);
@@ -949,23 +1007,23 @@ export default function VideoStudio({
           id: genId,
           url: res.url,
           prompt: trimmedPrompt,
-          model: selectedModel,
+          model: selectedRequestModel,
           aspect_ratio: selectedAr,
           duration: selectedDuration,
           timestamp: new Date().toISOString(),
         };
         addToLocalHistory(entry);
-        showVideoInCanvas(res.url, selectedModel);
+        showVideoInCanvas(res.url, selectedRequestModel);
         if (onGenerationComplete)
           onGenerationComplete({
             url: res.url,
-            model: selectedModel,
+            model: selectedRequestModel,
             prompt: trimmedPrompt,
             type: "video",
           });
       } else {
         // T2V (including extend mode)
-        const params = { model: selectedModel };
+        const params = { model: selectedRequestModel };
         if (trimmedPrompt) params.prompt = trimmedPrompt;
 
         if (isExtendMode) {
@@ -999,17 +1057,17 @@ export default function VideoStudio({
           id: genId,
           url: res.url,
           prompt: trimmedPrompt,
-          model: selectedModel,
+          model: selectedRequestModel,
           aspect_ratio: selectedAr,
           duration: selectedDuration,
           timestamp: new Date().toISOString(),
         };
         addToLocalHistory(entry);
-        showVideoInCanvas(res.url, selectedModel);
+        showVideoInCanvas(res.url, selectedRequestModel);
         if (onGenerationComplete)
           onGenerationComplete({
             url: res.url,
-            model: selectedModel,
+            model: selectedRequestModel,
             prompt: trimmedPrompt,
             type: "video",
           });
@@ -1028,6 +1086,8 @@ export default function VideoStudio({
     v2vMode,
     imageMode,
     selectedModel,
+    selectedRequestModel,
+    litellmModels,
     selectedAr,
     selectedDuration,
     selectedResolution,
@@ -1053,12 +1113,11 @@ export default function VideoStudio({
     resetToPromptBar();
     setPrompt("");
     setUploadedImageUrl(null);
-    setUploadedImagePreview(null);
     setImageMode(false);
     setUploadedVideoUrl(null);
     setUploadedVideoName(null);
     setV2vMode(false);
-    const first = t2vModels[0];
+    const first = getCurrentModels()[0];
     setSelectedModel(first.id);
     setSelectedModelName(first.name);
     applyControlsForModel(first.id, false, false);
@@ -1071,11 +1130,11 @@ export default function VideoStudio({
     resetToPromptBar();
     setPrompt("");
     setUploadedImageUrl(null);
-    setUploadedImagePreview(null);
     setImageMode(false);
-    setSelectedModel("seedance-v2.0-extend");
-    setSelectedModelName("Seedance 2.0 Extend");
-    applyControlsForModel("seedance-v2.0-extend", false, false);
+    const first = getCurrentModels()[0];
+    setSelectedModel(first.id);
+    setSelectedModelName(first.name);
+    applyControlsForModel(first.id, false, false);
     setPromptDisabled(false);
     setTimeout(() => textareaRef.current?.focus(), 50);
   }, [lastGenerationId, resetToPromptBar, applyControlsForModel]);
@@ -1521,6 +1580,7 @@ export default function VideoStudio({
                       selectedModel={selectedModel}
                       onSelect={handleModelSelect}
                       onClose={() => setOpenDropdown(null)}
+                      models={getCurrentModels()}
                     />
                   </div>
                 )}

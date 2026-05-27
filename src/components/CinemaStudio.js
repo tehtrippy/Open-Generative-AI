@@ -1,8 +1,9 @@
 
-import { muapi } from '../lib/muapi.js';
+import { litellmApi } from '../lib/litellmApi.js';
 import { CameraControls } from './CameraControls.js';
 import { buildNanoBananaPrompt, CAMERA_MAP, LENS_MAP, FOCAL_PERSPECTIVE, APERTURE_EFFECT } from '../lib/promptUtils.js';
 import { AuthModal } from './AuthModal.js';
+import { fetchLiteLLMModels } from '../lib/litellmModels.js';
 
 export function CinemaStudio() {
     const container = document.createElement('div');
@@ -17,9 +18,18 @@ export function CinemaStudio() {
         focal: 35,
         aperture: "f/1.4"
     };
+    let selectedModel = '__loading__';
     
     // Camera builder panel state
     let showCameraBuilder = false;
+
+    fetchLiteLLMModels().then((models) => {
+        if (models[0]?.id) selectedModel = models[0].id;
+        else selectedModel = '__error__';
+    }).catch((error) => {
+        console.error('[CinemaStudio] LiteLLM model load failed:', error);
+        selectedModel = '__error__';
+    });
 
     // ==========================================
     // 1. HERO SECTION (Empty State)
@@ -537,9 +547,14 @@ export function CinemaStudio() {
         const basePrompt = textarea.value.trim();
         if (!basePrompt) return;
 
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) {
+        const apiKey = localStorage.getItem('litellm_key');
+        const apiUrl = localStorage.getItem('litellm_url');
+        if (!apiKey || !apiUrl) {
             AuthModal(() => generateBtn.click());
+            return;
+        }
+        if (!selectedModel || selectedModel.startsWith('__')) {
+            alert('Please wait for LiteLLM models to load.');
             return;
         }
 
@@ -556,8 +571,8 @@ export function CinemaStudio() {
         );
 
         try {
-            const res = await muapi.generateImage({
-                model: 'nano-banana-pro',
+            const res = await litellmApi.generateImage({
+                model: selectedModel,
                 prompt: finalPrompt,
                 aspect_ratio: currentSettings.aspect_ratio,
                 resolution: (resBtn.dataset.value || '1k').toLowerCase(),

@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { processLipSync, uploadFile } from "../muapi.js";
+import { processLipSync, uploadFile } from "../litellmApi.js";
+import { fetchLiteLLMModels, resolveLiteLLMModelId } from "../litellmModels.js";
 import {
   lipsyncModels,
   imageLipSyncModels,
@@ -323,12 +324,13 @@ export default function LipSyncStudio({
   onFilesHandled,
 }) {
   const PERSIST_KEY = "hg_lipsync_studio_persistent";
+  const fallbackModel = { id: "__loading__", name: "Loading models..." };
+  const [litellmModels, setLiteLLMModels] = useState([]);
 
   // ── Mode & model state ──────────────────────────────────────────────────
   const [inputMode, setInputMode] = useState("image"); // 'image' | 'video'
 
-  const currentModels =
-    inputMode === "image" ? imageLipSyncModels : videoLipSyncModels;
+  const currentModels = litellmModels.length ? litellmModels : [fallbackModel];
   const firstModel = currentModels[0];
 
   const [selectedModelId, setSelectedModelId] = useState(firstModel?.id ?? "");
@@ -378,6 +380,26 @@ export default function LipSyncStudio({
   // ── Video ref for result ────────────────────────────────────────────────
   const resultVideoRef = useRef(null);
   const hasRestored = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLiteLLMModels().then((models) => {
+      if (cancelled) return;
+      setLiteLLMModels(models);
+      if (models.length > 0) {
+        const resolvedId = resolveLiteLLMModelId(selectedModelId, models);
+        const resolvedModel = models.find((model) => model.id === resolvedId);
+        if (resolvedModel && selectedModelId !== resolvedModel.id) {
+          setSelectedModelId(resolvedModel.id);
+          setSelectedResolution("");
+        } else if (!resolvedModel) {
+          setSelectedModelId(models[0].id);
+          setSelectedResolution("");
+        }
+      }
+    });
+    return () => { cancelled = true; };
+  }, [selectedModelId]);
 
   // ── Persistence: Load ────────────────────────────────────────────────────
   useEffect(() => {
@@ -451,21 +473,20 @@ export default function LipSyncStudio({
   ]);
 
   // ── Derived model info ──────────────────────────────────────────────────
-  const selectedModel = lipsyncModels.find((m) => m.id === selectedModelId);
-  const resolutionOptions = getResolutionsForLipSyncModel(selectedModelId);
+  const selectedRequestModelId = resolveLiteLLMModelId(selectedModelId, currentModels);
+  const selectedModel = currentModels.find((m) => m.id === selectedRequestModelId) || currentModels.find((m) => m.id === selectedModelId);
+  const resolutionOptions = [];
   const showResolution = resolutionOptions.length > 0;
-  const showPrompt = !!selectedModel?.hasPrompt;
+  const showPrompt = true;
 
   // ── Sync model when mode changes ────────────────────────────────────────
   useEffect(() => {
     if (hasRestored.current) return;
-    const models =
-      inputMode === "image" ? imageLipSyncModels : videoLipSyncModels;
-    const first = models[0];
+    const first = currentModels[0];
     if (!first) return;
     setSelectedModelId(first.id);
-    setSelectedResolution(first.inputs?.resolution?.default ?? "480p");
-  }, [inputMode]);
+    setSelectedResolution("");
+  }, [inputMode, currentModels]);
 
   // ── Upload handlers ─────────────────────────────────────────────────────
   const handleImageUpload = useCallback(
@@ -583,12 +604,7 @@ export default function LipSyncStudio({
   // ── Model selection ─────────────────────────────────────────────────────
   const handleModelSelect = (model) => {
     setSelectedModelId(model.id);
-    const resolutions = getResolutionsForLipSyncModel(model.id);
-    if (resolutions.length > 0) {
-      setSelectedResolution(
-        model.inputs?.resolution?.default ?? resolutions[0],
-      );
-    }
+    setSelectedResolution("");
   };
 
   // ── History helpers ─────────────────────────────────────────────────────
@@ -627,13 +643,21 @@ export default function LipSyncStudio({
       alert("Please upload a source video first.");
       return;
     }
+    if (
+      !selectedRequestModelId ||
+      selectedRequestModelId.startsWith("__") ||
+      !litellmModels.some((model) => model.id === selectedRequestModelId)
+    ) {
+      alert("Please wait for LiteLLM models to load.");
+      return;
+    }
 
     setIsGenerating(true);
     setGenerateError(null);
 
     try {
       const lipsyncParams = {
-        model: selectedModelId,
+        model: selectedRequestModelId,
         audio_url: audioUrl,
       };
       if (inputMode === "image") lipsyncParams.image_url = imageUrl;
@@ -651,7 +675,7 @@ export default function LipSyncStudio({
         id: genId,
         url: res.url,
         prompt,
-        model: selectedModelId,
+        model: selectedRequestModelId,
         timestamp: new Date().toISOString(),
       };
 
@@ -664,7 +688,7 @@ export default function LipSyncStudio({
       if (onGenerationComplete) {
         onGenerationComplete({
           url: res.url,
-          model: selectedModelId,
+          model: selectedRequestModelId,
           prompt,
           type: "lipsync",
         });

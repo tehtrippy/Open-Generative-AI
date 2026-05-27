@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { generateImage, uploadFile } from "../muapi.js";
+import { generateImage, uploadFile } from "../litellmApi.js";
+import { fetchLiteLLMModels, resolveLiteLLMModelId } from "../litellmModels.js";
 
 // ─── Constants (inlined from promptUtils) ───────────────────────────────────
 
@@ -458,6 +459,8 @@ export default function CinemaStudio({
     aperture: "f/1.4",
   });
   const [resolution, setResolution] = useState("2K");
+  const [litellmModels, setLiteLLMModels] = useState([]);
+  const [selectedModelId, setSelectedModelId] = useState("__loading__");
 
   // ── UI state ──
   const [isOverlayOpen, setIsOverlayOpen] = useState(false);
@@ -472,6 +475,24 @@ export default function CinemaStudio({
 
   // ── Internal history state (used when historyItems prop is not provided) ──
   const [internalHistory, setInternalHistory] = useState([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLiteLLMModels().then((models) => {
+      if (cancelled) return;
+      setLiteLLMModels(models);
+      if (models.length > 0) {
+        const resolvedId = resolveLiteLLMModelId(selectedModelId, models);
+        const resolvedModel = models.find((model) => model.id === resolvedId);
+        if (resolvedModel && selectedModelId !== resolvedModel.id) {
+          setSelectedModelId(resolvedModel.id);
+        } else if (!resolvedModel) {
+          setSelectedModelId(models[0].id);
+        }
+      }
+    });
+    return () => { cancelled = true; };
+  }, [selectedModelId]);
 
   // ── Dropdown state ──
   const [openDropdown, setOpenDropdown] = useState(null); // 'ar' | 'res' | null
@@ -515,6 +536,7 @@ export default function CinemaStudio({
         const data = JSON.parse(stored);
         if (data.settings) setSettings(data.settings);
         if (data.resolution) setResolution(data.resolution);
+        if (data.selectedModelId) setSelectedModelId(data.selectedModelId);
         if (data.internalHistory) setInternalHistory(data.internalHistory);
         if (data.uploadedImage) setUploadedImage(data.uploadedImage);
       }
@@ -542,6 +564,7 @@ export default function CinemaStudio({
         const state = {
           settings,
           resolution,
+          selectedModelId,
           internalHistory,
           uploadedImage,
         };
@@ -551,7 +574,7 @@ export default function CinemaStudio({
       }
     }, 500); // 500ms debounce
     return () => clearTimeout(timer);
-  }, [settings, resolution, internalHistory, uploadedImage]);
+  }, [settings, resolution, selectedModelId, internalHistory, uploadedImage]);
 
   // Derive effective history (prop wins over internal)
   const history = historyItems != null ? historyItems : internalHistory;
@@ -586,10 +609,20 @@ export default function CinemaStudio({
       settings.focal,
       settings.aperture,
     );
+    const requestModelId = resolveLiteLLMModelId(selectedModelId, litellmModels);
+    if (
+      !requestModelId ||
+      requestModelId.startsWith("__") ||
+      !litellmModels.some((model) => model.id === requestModelId)
+    ) {
+      alert("Please wait for LiteLLM models to load.");
+      setIsGenerating(false);
+      return;
+    }
 
     try {
       const res = await generateImage(apiKey, {
-        model: uploadedImage ? "nano-banana-pro-edit" : "nano-banana-pro",
+        model: requestModelId,
         prompt: finalPrompt,
         aspect_ratio: settings.aspect_ratio,
         resolution: resolution.toLowerCase(),
@@ -609,6 +642,7 @@ export default function CinemaStudio({
             aperture: settings.aperture,
             aspect_ratio: settings.aspect_ratio,
             resolution,
+            model: requestModelId,
           },
         };
 
@@ -622,7 +656,7 @@ export default function CinemaStudio({
         if (onGenerationComplete) {
           onGenerationComplete({
             url: res.url,
-            model: "nano-banana-pro",
+            model: requestModelId,
             prompt: basePrompt,
             type: "cinema",
           });
@@ -639,6 +673,8 @@ export default function CinemaStudio({
   }, [
     settings,
     resolution,
+    selectedModelId,
+    litellmModels,
     apiKey,
     isGenerating,
     onGenerationComplete,
@@ -904,6 +940,18 @@ export default function CinemaStudio({
             </div>
             <div className="flex justify-between gap-2">
               <div className="flex flex-wrap items-center gap-3">
+                <select
+                  value={selectedModelId}
+                  onChange={(e) => setSelectedModelId(e.target.value)}
+                  className="max-w-[180px] bg-white/[0.03] hover:bg-white/10 text-xs font-bold text-white/60 transition-colors rounded-md border border-white/[0.03] px-3 py-1.5 outline-none"
+                >
+                  {(litellmModels.length ? litellmModels : [{ id: "__loading__", name: "Loading models..." }]).map((model) => (
+                    <option key={model.id} value={model.id} className="bg-[#0a0a0a] text-white">
+                      {model.name}
+                    </option>
+                  ))}
+                </select>
+
                 {/* Aspect Ratio Button */}
                 <div className="relative">
                   <button

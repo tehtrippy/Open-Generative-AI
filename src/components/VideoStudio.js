@@ -1,38 +1,25 @@
-import { muapi } from '../lib/muapi.js';
+import { litellmApi } from '../lib/litellmApi.js';
 import { t2vModels, getAspectRatiosForVideoModel, getDurationsForModel, getResolutionsForVideoModel, i2vModels, getAspectRatiosForI2VModel, getDurationsForI2VModel, getResolutionsForI2VModel, v2vModels, getModesForModel } from '../lib/models.js';
 import { AuthModal } from './AuthModal.js';
 import { createUploadPicker } from './UploadPicker.js';
 import { savePendingJob, removePendingJob, getPendingJobs } from '../lib/pendingJobs.js';
-import { localAI, isLocalAIAvailable } from '../lib/localInferenceClient.js';
-import { isWan2gpModelId, getLocalModelById, localT2VModels, localI2VModels } from '../lib/localModels.js';
+import { fetchLiteLLMModels, getDefaultAspectRatios } from '../lib/litellmModels.js';
+import { generateVideo as byteplusGenerate, videoModels as byteplusModels, hasBytePlusCredentials } from '../lib/byteplus.js';
 
-// Promotes a wan2gp catalog entry (lib/localModels.js shape) into the
-// `inputs`-shaped descriptor the Video Studio dropdowns/controls expect.
-const adaptLocalToVideoEntry = (m) => ({
-    id: m.id,
-    name: m.name,
-    provider: 'wan2gp',
-    inputs: {
-        prompt: { type: 'string', name: 'prompt', title: 'Prompt' },
-        aspect_ratio: { type: 'string', name: 'aspect_ratio', enum: m.aspectRatios || ['16:9', '1:1', '9:16'], default: (m.aspectRatios || ['16:9'])[0] },
-    },
-});
+const externalEngine = {
+    onProgress() { return () => {}; },
+    async generate() { throw new Error('External engine generation is disabled.'); },
+};
 
 export function VideoStudio() {
     const container = document.createElement('div');
     container.className = 'w-full h-full flex flex-col items-center justify-center bg-app-bg relative p-4 md:p-6 overflow-y-auto custom-scrollbar overflow-x-hidden';
 
-    // Merge Wan2GP video models in only when running inside Electron AND the
-    // user has a Wan2GP server configured. We can't probe synchronously, so
-    // we always include them when isLocalAIAvailable() — getCurrentModel()
-    // reads from these arrays, so they need to be present from init.
-    const localT2V = isLocalAIAvailable() ? localT2VModels.map(adaptLocalToVideoEntry) : [];
-    const localI2V = isLocalAIAvailable() ? localI2VModels.map(adaptLocalToVideoEntry) : [];
-    const allT2V = [...t2vModels, ...localT2V];
-    const allI2V = [...i2vModels, ...localI2V];
+    const fallbackModel = { id: '__loading__', name: 'Loading LiteLLM models...', family: 'litellm', inputs: { aspect_ratio: { default: '16:9' } } };
+    let litellmModels = [fallbackModel];
 
     // --- State ---
-    const defaultModel = allT2V[0];
+    const defaultModel = fallbackModel;
     let selectedModel = defaultModel.id;
     let selectedModelName = defaultModel.name;
     let selectedAr = defaultModel.inputs?.aspect_ratio?.default || '16:9';
@@ -50,32 +37,36 @@ export function VideoStudio() {
     let v2vMode = false;   // true = video-to-video tools mode
     let uploadedVideoUrl = null;
 
-    const getCurrentModels = () => v2vMode ? v2vModels : (imageMode ? allI2V : allT2V);
-    // Local Wan2GP entries don't live in the Muapi-derived helpers, so we
-    // resolve aspect ratios off the catalog when the selected id is local.
-    const getCurrentAspectRatios = (id) => {
-        const local = getLocalModelById(id);
-        if (local) return local.aspectRatios || ['16:9', '1:1', '9:16'];
-        return imageMode ? getAspectRatiosForI2VModel(id) : getAspectRatiosForVideoModel(id);
+    const allModels = () => [...byteplusModels, ...litellmModels];
+    const getCurrentModels = () => allModels();
+    const getCurrentAspectRatios = (modelId) => {
+        const m = allModels().find(x => x.id === modelId);
+        if (m?.inputs?.aspect_ratio?.enum) return m.inputs.aspect_ratio.enum;
+        return getDefaultAspectRatios();
     };
-    const getCurrentDurations = (id) => {
-        if (getLocalModelById(id)) return [];
-        return imageMode ? getDurationsForI2VModel(id) : getDurationsForModel(id);
+    const getCurrentDurations = (modelId) => {
+        const m = allModels().find(x => x.id === modelId);
+        if (m?.inputs?.duration) {
+            const d = m.inputs.duration;
+            const result = [];
+            for (let i = d.minValue || d.default || 2; i <= (d.maxValue || 10); i += (d.step || 1)) result.push(i);
+            return result.length ? result : [d.default || 5];
+        }
+        return [5, 10];
     };
-    const getCurrentResolutions = (id) => {
-        if (getLocalModelById(id)) return [];
-        return imageMode ? getResolutionsForI2VModel(id) : getResolutionsForVideoModel(id);
+    const getCurrentResolutions = (modelId) => {
+        const m = allModels().find(x => x.id === modelId);
+        if (m?.inputs?.resolution?.enum) return m.inputs.resolution.enum;
+        return [];
     };
-    const getCurrentModes = (id) => getModesForModel(id);
+    const getCurrentModes = () => [];
     const getCurrentModel = () => getCurrentModels().find(m => m.id === selectedModel);
     const isMotionControlV2V = () => v2vMode && !!getCurrentModel()?.imageField;
     const getQualitiesForModel = (id) => {
-        const model = getCurrentModels().find(m => m.id === id);
-        return model?.inputs?.quality?.enum || [];
+        return [];
     };
     const getEffectNamesForModel = (id) => {
-        const model = getCurrentModels().find(m => m.id === id);
-        return model?.inputs?.name?.enum || [];
+        return [];
     };
 
     // ==========================================
@@ -139,13 +130,6 @@ export function VideoStudio() {
             }
             if (!imageMode) {
                 imageMode = true;
-                const currentT2V = allT2V.find(m => m.id === selectedModel);
-                const sibling = currentT2V?.family
-                    ? allI2V.find(m => m.family === currentT2V.family)
-                    : null;
-                const target = sibling || allI2V[0];
-                selectedModel = target.id;
-                selectedModelName = target.name;
                 document.getElementById('v-model-btn-label').textContent = selectedModelName;
                 updateControlsForModel(selectedModel);
             }
@@ -160,17 +144,17 @@ export function VideoStudio() {
             // Clearing the start frame invalidates any selected end frame.
             uploadedEndImageUrl = null;
             endPicker?.reset();
-            selectedModel = allT2V[0].id;
-            selectedModelName = allT2V[0].name;
+            const firstModel = getCurrentModels()[0] || fallbackModel;
+            selectedModel = firstModel.id;
+            selectedModelName = firstModel.name;
             document.getElementById('v-model-btn-label').textContent = selectedModelName;
             updateControlsForModel(selectedModel);
             textarea.placeholder = 'Describe the video you want to create';
             textarea.disabled = false;
         },
-        // Route the upload through the configured Wan2GP server when the active
-        // model is local; otherwise fall back to the Muapi-hosted upload.
-        uploadFn: (file) => isWan2gpModelId(selectedModel) ? localAI.uploadFileToWan2gp(file) : muapi.uploadFile(file),
-        requireApiKey: () => !isWan2gpModelId(selectedModel),
+        // Route uploads through the configured LiteLLM gateway.
+        uploadFn: (file) => litellmApi.uploadFile(file),
+        requireApiKey: () => true,
     });
     topRow.appendChild(picker.trigger);
     container.appendChild(picker.panel);
@@ -183,8 +167,8 @@ export function VideoStudio() {
         anchorContainer: container,
         onSelect: ({ url }) => { uploadedEndImageUrl = url; },
         onClear: () => { uploadedEndImageUrl = null; },
-        uploadFn: (file) => isWan2gpModelId(selectedModel) ? localAI.uploadFileToWan2gp(file) : muapi.uploadFile(file),
-        requireApiKey: () => !isWan2gpModelId(selectedModel),
+        uploadFn: (file) => litellmApi.uploadFile(file),
+        requireApiKey: () => true,
     });
     endPicker.trigger.title = 'End frame (optional)';
     // Visual marker: small "L" badge in the corner so users can tell the two
@@ -276,8 +260,9 @@ export function VideoStudio() {
             return;
         }
         v2vMode = false;
-        selectedModel = allT2V[0].id;
-        selectedModelName = allT2V[0].name;
+        const firstModel = getCurrentModels()[0] || fallbackModel;
+        selectedModel = firstModel.id;
+        selectedModelName = firstModel.name;
         document.getElementById('v-model-btn-label').textContent = selectedModelName;
         updateControlsForModel(selectedModel);
         textarea.placeholder = 'Describe the video you want to create';
@@ -297,15 +282,16 @@ export function VideoStudio() {
         const file = e.target.files[0];
         if (!file) return;
 
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) {
+        const apiKey = localStorage.getItem('litellm_key');
+        const apiUrl = localStorage.getItem('litellm_url');
+        if (!apiKey || !apiUrl) {
             AuthModal(() => videoFileInput.click());
             return;
         }
 
         showVideoSpinner();
         try {
-            const url = await muapi.uploadFile(file);
+            const url = await litellmApi.uploadFile(file);
             uploadedVideoUrl = url;
             showVideoReady(file.name);
 
@@ -323,8 +309,6 @@ export function VideoStudio() {
                     imageMode = false;
                 }
                 v2vMode = true;
-                selectedModel = v2vModels[0].id;
-                selectedModelName = v2vModels[0].name;
                 document.getElementById('v-model-btn-label').textContent = selectedModelName;
                 updateControlsForModel(selectedModel);
                 textarea.placeholder = 'Video ready — click Generate to remove watermark';
@@ -426,12 +410,12 @@ export function VideoStudio() {
     controlsLeft.appendChild(advancedBtn);
 
     // Initial visibility (t2v mode)
-    const initDurations = getDurationsForModel(defaultModel.id);
+    const initDurations = getCurrentDurations(defaultModel.id);
     durationBtn.style.display = initDurations.length > 0 ? 'flex' : 'none';
-    const initResolutions = getResolutionsForVideoModel(defaultModel.id);
+    const initResolutions = getCurrentResolutions(defaultModel.id);
     resolutionBtn.style.display = initResolutions.length > 0 ? 'flex' : 'none';
     qualityBtn.style.display = 'none';
-    modeBtn.style.display = getModesForModel(defaultModel.id).length > 0 ? 'flex' : 'none';
+    modeBtn.style.display = getCurrentModes(defaultModel.id).length > 0 ? 'flex' : 'none';
     effectNameBtn.style.display = 'none';
 
     const generateBtn = document.createElement('button');
@@ -444,6 +428,33 @@ export function VideoStudio() {
     bar.appendChild(bottomRow);
     promptWrapper.appendChild(bar);
     container.appendChild(promptWrapper);
+
+    fetchLiteLLMModels().then((models) => {
+        litellmModels = models.length ? models : [{ ...fallbackModel, name: 'No LiteLLM models found' }];
+        // Default-select the first available model (BytePlus or LiteLLM)
+        const firstModel = allModels()[0];
+        if (firstModel?.id && firstModel.id !== '__loading__') {
+            selectedModel = firstModel.id;
+            selectedModelName = firstModel.name;
+            selectedAr = firstModel.inputs?.aspect_ratio?.default || '16:9';
+            document.getElementById('v-model-btn-label').textContent = selectedModelName;
+            updateControlsForModel(selectedModel);
+        }
+    }).catch((error) => {
+        console.error('[VideoStudio] LiteLLM model load failed:', error);
+        litellmModels = [{ id: '__error__', name: 'Model load failed', family: 'litellm', inputs: { aspect_ratio: { default: '16:9' } } }];
+        // Fallback: still have BytePlus models available
+        const bpDefault = byteplusModels.find(m => m.isDefault) || byteplusModels[0];
+        if (bpDefault) {
+            selectedModel = bpDefault.id;
+            selectedModelName = bpDefault.name;
+            selectedAr = bpDefault.inputs?.aspect_ratio?.default || '16:9';
+            document.getElementById('v-model-btn-label').textContent = selectedModelName;
+            updateControlsForModel(selectedModel);
+        } else {
+            document.getElementById('v-model-btn-label').textContent = 'Model load failed';
+        }
+    });
 
     // ==========================================
     // 3. DROPDOWNS
@@ -627,14 +638,31 @@ export function VideoStudio() {
                 list.innerHTML = '';
                 const lf = filter.toLowerCase();
 
-                // Regular generation models (always t2v or i2v, never v2v)
-                const generationModels = imageMode ? allI2V : allT2V;
-                const filteredMain = generationModels
+                // BytePlus models section
+                const filteredBp = byteplusModels
                     .filter(m => m.name.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf));
-                filteredMain.forEach(m => list.appendChild(makeModelItem(m, false)));
+                if (filteredBp.length > 0) {
+                    const bpHeader = document.createElement('div');
+                    bpHeader.className = 'text-[10px] font-bold text-cyan-400/70 uppercase tracking-widest px-3 py-2 border-b border-white/5 mb-1';
+                    bpHeader.textContent = 'BytePlus Models';
+                    list.appendChild(bpHeader);
+                    filteredBp.forEach(m => list.appendChild(makeModelItem(m, false)));
+                }
 
-                // Video Tools section
-                const filteredV2V = v2vModels.filter(m => m.name.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf));
+                // LiteLLM models section
+                const filteredMain = litellmModels
+                    .filter(m => m.name.toLowerCase().includes(lf) || m.id.toLowerCase().includes(lf));
+                if (filteredMain.length > 0) {
+                    if (filteredBp.length > 0) {
+                        const llHeader = document.createElement('div');
+                        llHeader.className = 'text-[10px] font-bold text-white/40 uppercase tracking-widest px-3 py-2 mt-1 border-t border-white/5';
+                        llHeader.textContent = 'LiteLLM Models';
+                        list.appendChild(llHeader);
+                    }
+                    filteredMain.forEach(m => list.appendChild(makeModelItem(m, false)));
+                }
+
+                const filteredV2V = [];
                 if (filteredV2V.length > 0) {
                     const sectionLabel = document.createElement('div');
                     sectionLabel.className = 'text-[10px] font-bold text-orange-400/70 uppercase tracking-widest px-3 py-2 mt-1 border-t border-white/5';
@@ -897,9 +925,7 @@ export function VideoStudio() {
         hero.classList.add('hidden');
         promptWrapper.classList.add('hidden');
 
-        // Show extend button only for seedance-v2.0-t2v and i2v (not extend itself)
-        const isSeedance2 = genModel && (genModel === 'seedance-v2.0-t2v' || genModel === 'seedance-v2.0-i2v');
-        extendBtn.classList.toggle('hidden', !isSeedance2);
+        extendBtn.classList.add('hidden');
 
         resultVideo.src = videoUrl;
         resultVideo.onloadeddata = () => {
@@ -994,7 +1020,7 @@ export function VideoStudio() {
         const pending = getPendingJobs('video');
         if (!pending.length) return;
 
-        const apiKey = localStorage.getItem('muapi_key');
+        const apiKey = localStorage.getItem('litellm_key');
         if (!apiKey) return; // can't poll without key; jobs remain for next time
 
         const banner = document.createElement('div');
@@ -1007,7 +1033,7 @@ export function VideoStudio() {
             const elapsedAttempts = Math.floor((Date.now() - job.submittedAt) / job.interval);
             const attemptsLeft = Math.max(1, job.maxAttempts - elapsedAttempts);
             try {
-                const result = await muapi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
+                const result = await litellmApi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
                 const url = result.outputs?.[0] || result.url || result.output?.url;
                 if (url) {
                     addToHistory({ id: job.requestId, url, ...job.historyMeta, timestamp: new Date().toISOString() });
@@ -1052,8 +1078,9 @@ export function VideoStudio() {
         uploadedVideoUrl = null;
         v2vMode = false;
         showVideoIcon();
-        selectedModel = allT2V[0].id;
-        selectedModelName = allT2V[0].name;
+        const firstModel = getCurrentModels()[0] || fallbackModel;
+        selectedModel = firstModel.id;
+        selectedModelName = firstModel.name;
         document.getElementById('v-model-btn-label').textContent = selectedModelName;
         updateControlsForModel(selectedModel);
         textarea.placeholder = 'Describe the video you want to create';
@@ -1068,11 +1095,7 @@ export function VideoStudio() {
         picker.reset();
         uploadedImageUrl = null;
         imageMode = false;
-        selectedModel = 'seedance-v2.0-extend';
-        selectedModelName = 'Seedance 2.0 Extend';
-        document.getElementById('v-model-btn-label').textContent = selectedModelName;
-        updateControlsForModel(selectedModel);
-        textarea.placeholder = 'Optional: describe how to continue the video...';
+        alert('Video extension depends on gateway-specific support. Select the extension model exposed by your LiteLLM gateway if available.');
         textarea.focus();
     };
 
@@ -1114,13 +1137,23 @@ export function VideoStudio() {
             }
         }
 
-        const isLocal = isWan2gpModelId(selectedModel);
+        const isExternal = false;
+        const isBytePlus = model?.provider === 'byteplus';
 
-        // Local Wan2GP generations don't go through Muapi — skip the auth gate.
-        if (!isLocal) {
-            const apiKey = localStorage.getItem('muapi_key');
-            if (!apiKey) {
+        if (isBytePlus) {
+            if (!hasBytePlusCredentials()) {
                 AuthModal(() => generateBtn.click());
+                return;
+            }
+        } else if (!isLocal) {
+            const apiKey = localStorage.getItem('litellm_key');
+            const apiUrl = localStorage.getItem('litellm_url');
+            if (!apiKey || !apiUrl) {
+                AuthModal(() => generateBtn.click());
+                return;
+            }
+            if (!selectedModel || selectedModel.startsWith('__')) {
+                alert('Please wait for LiteLLM models to load.');
                 return;
             }
         }
@@ -1129,10 +1162,10 @@ export function VideoStudio() {
         generateBtn.disabled = true;
         generateBtn.innerHTML = `<span class="animate-spin inline-block mr-2 text-black">◌</span> Generating...`;
 
-        // For local generations, surface step progress in the button label.
+        // For external generations, surface step progress in the button label.
         let unsubscribeProgress = null;
         if (isLocal) {
-            unsubscribeProgress = localAI.onProgress(({ status, progress }) => {
+            unsubscribeProgress = externalEngine.onProgress(({ status, progress }) => {
                 const pct = typeof progress === 'number' ? Math.round(progress * 100) : null;
                 generateBtn.innerHTML = `<span class="animate-spin inline-block mr-2 text-black">◌</span> ${status || 'Generating'}${pct != null ? ` ${pct}%` : '…'}`;
             });
@@ -1148,9 +1181,6 @@ export function VideoStudio() {
         };
 
         try {
-            // ─── Local Wan2GP path ───────────────────────────────────────────
-            // Uploaded image URLs were minted by uploadFileToWan2gp(), so
-            // wan2gpProvider can rehydrate the Gradio file descriptor.
             if (isLocal) {
                 const localParams = {
                     model: selectedModel,
@@ -1158,8 +1188,8 @@ export function VideoStudio() {
                     aspect_ratio: selectedAr,
                 };
                 if (imageMode && uploadedImageUrl) localParams.image = uploadedImageUrl;
-                const res = await localAI.generate(localParams);
-                console.log('[VideoStudio] Local response:', res);
+                const res = await externalEngine.generate(localParams);
+                console.log('[VideoStudio] External response:', res);
                 if (res && res.url) {
                     const genId = Date.now().toString();
                     lastGenerationId = null;
@@ -1167,7 +1197,29 @@ export function VideoStudio() {
                     addToHistory({ id: genId, url: res.url, prompt, model: selectedModel, aspect_ratio: selectedAr, timestamp: new Date().toISOString() });
                     showVideoInCanvas(res.url, selectedModel);
                 } else {
-                    throw new Error('No video URL returned by Wan2GP');
+                    throw new Error('No video URL returned by LiteLLM');
+                }
+                generateBtn.disabled = false;
+                generateBtn.innerHTML = `Generate ✨`;
+                return;
+            }
+
+            // BytePlus direct generation
+            if (isBytePlus) {
+                const bpModel = byteplusModels.find(m => m.id === selectedModel);
+                if (bpModel?.type === 'i2v' && !uploadedImageUrl) {
+                    throw new Error('This model requires a start frame image. Upload an image first.');
+                }
+                generateBtn.innerHTML = `<span class="animate-spin inline-block mr-2 text-black">◌</span> Generating via BytePlus…`;
+                const bpOptions = { resolution: selectedResolution, duration: selectedDuration, ratio: selectedAr };
+                const bpImageUrl = uploadedImageUrl || null;
+                const res = await byteplusGenerate(selectedModel, prompt || '', bpOptions, bpImageUrl);
+                if (res && res.url) {
+                    const genId = res.taskId || Date.now().toString();
+                    addToHistory({ id: genId, url: res.url, prompt, model: selectedModel, aspect_ratio: selectedAr, duration: selectedDuration, timestamp: new Date().toISOString() });
+                    showVideoInCanvas(res.url, selectedModel);
+                } else {
+                    throw new Error('No video URL returned by BytePlus');
                 }
                 generateBtn.disabled = false;
                 generateBtn.innerHTML = `Generate ✨`;
@@ -1178,7 +1230,7 @@ export function VideoStudio() {
                 const v2vParams = { model: selectedModel, video_url: uploadedVideoUrl, onRequestId };
                 if (model?.imageField && uploadedImageUrl) v2vParams.image_url = uploadedImageUrl;
                 if (model?.hasPrompt && prompt) v2vParams.prompt = prompt;
-                const res = await muapi.processV2V(v2vParams);
+                const res = await litellmApi.processV2V(v2vParams);
                 console.log('[VideoStudio] V2V response:', res);
                 if (res && res.url) {
                     if (capturedRequestId) removePendingJob(capturedRequestId);
@@ -1214,7 +1266,7 @@ export function VideoStudio() {
                 if (selectedMode) i2vParams.mode = selectedMode;
                 if (selectedEffectName) i2vParams.name = selectedEffectName;
 
-                const res = await muapi.generateI2V(i2vParams);
+                const res = await litellmApi.generateI2V(i2vParams);
                 console.log('[VideoStudio] I2V response:', res);
 
                 if (res && res.url) {
@@ -1257,7 +1309,7 @@ export function VideoStudio() {
             if (selectedQuality) params.quality = selectedQuality;
             if (selectedMode) params.mode = selectedMode;
 
-            const res = await muapi.generateVideo(params);
+            const res = await litellmApi.generateVideo(params);
 
             console.log('[VideoStudio] Full response:', res);
 

@@ -1,8 +1,9 @@
-import { muapi } from '../lib/muapi.js';
+import { litellmApi } from '../lib/litellmApi.js';
 import { lipsyncModels, imageLipSyncModels, videoLipSyncModels, getLipSyncModelById, getResolutionsForLipSyncModel } from '../lib/models.js';
 import { AuthModal } from './AuthModal.js';
 import { createUploadPicker } from './UploadPicker.js';
 import { savePendingJob, removePendingJob, getPendingJobs } from '../lib/pendingJobs.js';
+import { fetchLiteLLMModels } from '../lib/litellmModels.js';
 
 export function LipSyncStudio() {
     const container = document.createElement('div');
@@ -11,16 +12,18 @@ export function LipSyncStudio() {
     // --- State ---
     // 'image' mode: portrait image + audio → video
     // 'video' mode: existing video + audio → lipsync video
+    const fallbackModel = { id: '__loading__', name: 'Loading LiteLLM models...', hasPrompt: true };
+    let litellmModels = [fallbackModel];
     let inputMode = 'image';
-    let selectedModel = imageLipSyncModels[0].id;
-    let selectedResolution = imageLipSyncModels[0].inputs?.resolution?.default || '480p';
+    let selectedModel = fallbackModel.id;
+    let selectedResolution = '';
     let uploadedImageUrl = null;
     let uploadedVideoUrl = null;
     let uploadedAudioUrl = null;
     let dropdownOpen = null;
 
-    const getCurrentModels = () => inputMode === 'image' ? imageLipSyncModels : videoLipSyncModels;
-    const getCurrentModel = () => lipsyncModels.find(m => m.id === selectedModel);
+    const getCurrentModels = () => litellmModels;
+    const getCurrentModel = () => getCurrentModels().find(m => m.id === selectedModel) || fallbackModel;
 
     // ==========================================
     // 1. HERO SECTION
@@ -168,11 +171,12 @@ export function LipSyncStudio() {
     videoFileInput.onchange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) { AuthModal(() => videoFileInput.click()); return; }
+        const apiKey = localStorage.getItem('litellm_key');
+        const apiUrl = localStorage.getItem('litellm_url');
+        if (!apiKey || !apiUrl) { AuthModal(() => videoFileInput.click()); return; }
         showVideoSpinner();
         try {
-            uploadedVideoUrl = await muapi.uploadFile(file);
+            uploadedVideoUrl = await litellmApi.uploadFile(file);
             showVideoReady(file.name);
         } catch (err) { showVideoIcon(); alert(`Video upload failed: ${err.message}`); }
         videoFileInput.value = '';
@@ -236,11 +240,12 @@ export function LipSyncStudio() {
     audioFileInput.onchange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) { AuthModal(() => audioFileInput.click()); return; }
+        const apiKey = localStorage.getItem('litellm_key');
+        const apiUrl = localStorage.getItem('litellm_url');
+        if (!apiKey || !apiUrl) { AuthModal(() => audioFileInput.click()); return; }
         showAudioSpinner();
         try {
-            uploadedAudioUrl = await muapi.uploadFile(file);
+            uploadedAudioUrl = await litellmApi.uploadFile(file);
             showAudioReady(file.name);
         } catch (err) { showAudioIcon(); alert(`Audio upload failed: ${err.message}`); }
         audioFileInput.value = '';
@@ -307,9 +312,22 @@ export function LipSyncStudio() {
     bottomRow.appendChild(resolutionBtn);
     bottomRow.appendChild(generateBtn);
     bar.appendChild(bottomRow);
+    resolutionBtn.classList.add('hidden');
 
     promptWrapper.appendChild(bar);
     container.appendChild(promptWrapper);
+
+    fetchLiteLLMModels().then((models) => {
+        litellmModels = models.length ? models.map((model) => ({ ...model, hasPrompt: true })) : [{ ...fallbackModel, name: 'No LiteLLM models found' }];
+        if (litellmModels[0]?.id && litellmModels[0].id !== '__loading__') {
+            selectedModel = litellmModels[0].id;
+            document.getElementById('ls-model-btn-label').textContent = litellmModels[0].name;
+        }
+    }).catch((error) => {
+        console.error('[LipSyncStudio] LiteLLM model load failed:', error);
+        litellmModels = [{ id: '__error__', name: 'Model load failed', hasPrompt: true }];
+        document.getElementById('ls-model-btn-label').textContent = 'Model load failed';
+    });
 
     // ==========================================
     // 3. DROPDOWN SYSTEM
@@ -337,7 +355,7 @@ export function LipSyncStudio() {
                 item.onclick = () => {
                     selectedModel = m.id;
                     document.getElementById('ls-model-btn-label').textContent = m.name;
-                    const resolutions = getResolutionsForLipSyncModel(selectedModel);
+                    const resolutions = [];
                     if (resolutions.length > 0) {
                         selectedResolution = m.inputs?.resolution?.default || resolutions[0];
                         document.getElementById('ls-resolution-btn-label').textContent = selectedResolution;
@@ -351,7 +369,7 @@ export function LipSyncStudio() {
                 dropdown.appendChild(item);
             });
         } else if (type === 'resolution') {
-            const resolutions = getResolutionsForLipSyncModel(selectedModel);
+            const resolutions = [];
             resolutions.forEach(r => {
                 const item = document.createElement('button');
                 item.type = 'button';
@@ -424,7 +442,7 @@ export function LipSyncStudio() {
         document.getElementById('ls-model-btn-label').textContent = models[0].name;
 
         // Update resolution
-        const resolutions = getResolutionsForLipSyncModel(selectedModel);
+        const resolutions = [];
         if (resolutions.length > 0) {
             selectedResolution = models[0].inputs?.resolution?.default || resolutions[0];
             document.getElementById('ls-resolution-btn-label').textContent = selectedResolution;
@@ -454,7 +472,7 @@ export function LipSyncStudio() {
     };
 
     // Hide resolution if first model has none
-    if (getResolutionsForLipSyncModel(selectedModel).length === 0) {
+    if ([].length === 0) {
         resolutionBtn.classList.add('hidden');
     }
 
@@ -587,7 +605,7 @@ export function LipSyncStudio() {
     (async () => {
         const pending = getPendingJobs('lipsync');
         if (!pending.length) return;
-        const apiKey = localStorage.getItem('muapi_key');
+        const apiKey = localStorage.getItem('litellm_key');
         if (!apiKey) return;
         const banner = document.createElement('div');
         banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[200] bg-[#111] border border-white/10 text-white text-sm px-5 py-3 rounded-2xl shadow-xl flex items-center gap-3';
@@ -598,7 +616,7 @@ export function LipSyncStudio() {
             const elapsedAttempts = Math.floor((Date.now() - job.submittedAt) / job.interval);
             const attemptsLeft = Math.max(1, job.maxAttempts - elapsedAttempts);
             try {
-                const result = await muapi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
+                const result = await litellmApi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
                 const url = result.outputs?.[0] || result.url || result.output?.url;
                 if (url) addToHistory({ id: job.requestId, url, ...job.historyMeta, timestamp: new Date().toISOString() });
             } catch (e) { console.warn('[LipSyncStudio] Pending job failed:', job.requestId, e.message); }
@@ -667,8 +685,13 @@ export function LipSyncStudio() {
             return;
         }
 
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) { AuthModal(() => generateBtn.click()); return; }
+        const apiKey = localStorage.getItem('litellm_key');
+        const apiUrl = localStorage.getItem('litellm_url');
+        if (!apiKey || !apiUrl) { AuthModal(() => generateBtn.click()); return; }
+        if (!selectedModel || selectedModel.startsWith('__')) {
+            alert('Please wait for LiteLLM models to load.');
+            return;
+        }
 
         hero.classList.add('opacity-0', 'scale-95', '-translate-y-10', 'pointer-events-none');
         generateBtn.disabled = true;
@@ -698,12 +721,12 @@ export function LipSyncStudio() {
 
             if (prompt && model?.hasPrompt) lipsyncParams.prompt = prompt;
 
-            const resolutions = getResolutionsForLipSyncModel(selectedModel);
+            const resolutions = [];
             if (resolutions.length > 0) lipsyncParams.resolution = selectedResolution;
 
             if (model?.hasSeed) lipsyncParams.seed = -1;
 
-            const res = await muapi.processLipSync(lipsyncParams);
+            const res = await litellmApi.processLipSync(lipsyncParams);
             console.log('[LipSyncStudio] Response:', res);
 
             if (res && res.url) {

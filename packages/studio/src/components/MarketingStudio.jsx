@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { uploadFile, generateMarketingStudioAd } from "../muapi.js";
+import { uploadFile, generateMarketingStudioAd } from "../litellmApi.js";
+import { fetchLiteLLMModels, resolveLiteLLMModelId } from "../litellmModels.js";
 
 const SCROLLBAR_STYLE = `
   .custom-scrollbar-thin::-webkit-scrollbar {
@@ -238,6 +239,8 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
   const [productImage, setProductImage] = useState(null);
   const [avatarImage, setAvatarImage] = useState(null);
   const [additionalImages, setAdditionalImages] = useState([]);
+  const [litellmModels, setLiteLLMModels] = useState([]);
+  const [selectedModelId, setSelectedModelId] = useState("__loading__");
   
   const [params, setParams] = useState({
     ratio: "9:16",
@@ -255,6 +258,24 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
 
   const textareaRef = useRef(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetchLiteLLMModels().then((models) => {
+      if (cancelled) return;
+      setLiteLLMModels(models);
+      if (models.length > 0) {
+        const resolvedId = resolveLiteLLMModelId(selectedModelId, models);
+        const resolvedModel = models.find((model) => model.id === resolvedId);
+        if (resolvedModel && selectedModelId !== resolvedModel.id) {
+          setSelectedModelId(resolvedModel.id);
+        } else if (!resolvedModel) {
+          setSelectedModelId(models[0].id);
+        }
+      }
+    });
+    return () => { cancelled = true; };
+  }, [selectedModelId]);
+
   // ── Persistence ───────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -264,6 +285,7 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
         const data = JSON.parse(stored);
         if (data.prompt) setPrompt(data.prompt);
         if (data.params) setParams(data.params);
+        if (data.selectedModelId) setSelectedModelId(data.selectedModelId);
         if (data.productImage) setProductImage(data.productImage);
         if (data.avatarImage) setAvatarImage(data.avatarImage);
         if (data.additionalImages) setAdditionalImages(data.additionalImages);
@@ -274,11 +296,11 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      const state = { prompt, params, productImage, avatarImage, additionalImages, history };
+      const state = { prompt, params, selectedModelId, productImage, avatarImage, additionalImages, history };
       localStorage.setItem(PERSIST_KEY, JSON.stringify(state));
     }, 500);
     return () => clearTimeout(timer);
-  }, [prompt, params, productImage, avatarImage, additionalImages, history]);
+  }, [prompt, params, selectedModelId, productImage, avatarImage, additionalImages, history]);
 
   // ── Handlers ───────────────────────────────────────────────────────────────
 
@@ -326,10 +348,19 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
   const handleGenerate = async () => {
     if (!prompt.trim()) return alert("Please enter an ad script.");
     if (!productImage) return alert("Please upload a product image.");
+    const requestModelId = resolveLiteLLMModelId(selectedModelId, litellmModels);
+    if (
+      !requestModelId ||
+      requestModelId.startsWith("__") ||
+      !litellmModels.some((model) => model.id === requestModelId)
+    ) {
+      return alert("Please wait for LiteLLM models to load.");
+    }
 
     setIsGenerating(true);
     try {
       const result = await generateMarketingStudioAd(apiKey, {
+        model: requestModelId,
         prompt,
         aspect_ratio: params.ratio,
         duration: params.duration,
@@ -344,6 +375,7 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
           url: result.url,
           prompt,
           format: params.format,
+          model: requestModelId,
           timestamp: new Date().toISOString()
         };
         setHistory(prev => [entry, ...prev]);
@@ -504,6 +536,18 @@ export default function MarketingStudio({ apiKey, droppedFiles, onFilesHandled }
               </div>
 
               {/* Format Button */}
+              <select
+                value={selectedModelId}
+                onChange={(e) => setSelectedModelId(e.target.value)}
+                className="max-w-[180px] bg-white/[0.03] hover:bg-white/[0.08] rounded border border-white/5 px-3 py-2 text-sm font-bold text-white/70 outline-none"
+              >
+                {(litellmModels.length ? litellmModels : [{ id: "__loading__", name: "Loading models..." }]).map((model) => (
+                  <option key={model.id} value={model.id} className="bg-[#0a0a0a] text-white">
+                    {model.name}
+                  </option>
+                ))}
+              </select>
+
               <div className="relative">
                 <button
                   onClick={(e) => { e.stopPropagation(); setDropdown(dropdown === 'format' ? null : 'format'); }}

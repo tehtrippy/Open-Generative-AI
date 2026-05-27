@@ -1,111 +1,64 @@
 import { cookies } from "next/headers";
 import AgentChatClient from "../AgentChatClient";
 
-/**
- * Server component — fetches both agentDetails and initialHistory
- * from the /api/agents proxy using the muapi_key cookie, then renders
- * the client chat component with existing conversation messages pre-loaded.
- *
- * URL: /agents/[agent_id]/[conversation_id]
- */
-export async function generateMetadata({ params }) {
+export async function generateMetadata() {
+  return { title: "Agent Chat - Open Generative AI" };
+}
+
+function getLiteLLMCredentials(cookieStore) {
   return {
-    title: `Agent Chat — Open Generative AI`,
+    key: cookieStore.get("litellm_key")?.value ? decodeURIComponent(cookieStore.get("litellm_key").value) : "",
+    url: cookieStore.get("litellm_url")?.value ? decodeURIComponent(cookieStore.get("litellm_url").value).replace(/\/+$/, "") : "http://localhost:4000",
   };
 }
 
-const BASE_URL = 'https://api.muapi.ai';
-
-async function fetchAgentDetails(agentId, apiKey) {
-  if (!apiKey) return null;
+async function fetchJson(credentials, path) {
+  if (!credentials.key) return null;
   try {
-    const res = await fetch(
-      `${BASE_URL}/agents/by-slug/${agentId}`,
-      {
-        cache: "no-store",
-        headers: { "x-api-key": apiKey },
-      }
-    );
-    if (res.ok) return await res.json();
-    
-    if (agentId.length > 20) {
-      const resId = await fetch(
-        `${BASE_URL}/agents/${agentId}`,
-        {
-          cache: "no-store",
-          headers: { "x-api-key": apiKey },
-        }
-      );
-      if (resId.ok) return await resId.json();
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchHistory(agentId, conversationId, apiKey) {
-  if (!apiKey) return null;
-  try {
-    // Try by slug first
-    const res = await fetch(
-      `${BASE_URL}/agents/by-slug/${agentId}/${conversationId}`,
-      {
-        cache: "no-store",
-        headers: { "x-api-key": apiKey },
-      }
-    );
-    if (res.ok) return await res.json();
-    
-    // Fallback to direct agent ID if needed
-    if (agentId.length > 20) {
-      const resId = await fetch(
-        `${BASE_URL}/agents/${agentId}/${conversationId}`,
-        {
-          cache: "no-store",
-          headers: { "x-api-key": apiKey },
-        }
-      );
-      if (resId.ok) return await resId.json();
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchUserData(apiKey) {
-  if (!apiKey) return null;
-  try {
-    const res = await fetch(`${BASE_URL}/api/v1/account/balance`, {
+    const res = await fetch(`${credentials.url}${path}`, {
       cache: "no-store",
-      headers: { "x-api-key": apiKey },
+      headers: { Authorization: `Bearer ${credentials.key}` },
     });
-    if (!res.ok) return null;
-    return await res.json();
+    return res.ok ? await res.json() : null;
   } catch {
     return null;
   }
+}
+
+async function fetchAgentDetails(agentId, credentials) {
+  return (
+    await fetchJson(credentials, `/agents/by-slug/${agentId}`) ||
+    (agentId.length > 20 ? await fetchJson(credentials, `/agents/${agentId}`) : null)
+  );
+}
+
+async function fetchHistory(agentId, conversationId, credentials) {
+  return (
+    await fetchJson(credentials, `/agents/by-slug/${agentId}/${conversationId}`) ||
+    (agentId.length > 20 ? await fetchJson(credentials, `/agents/${agentId}/${conversationId}`) : null)
+  );
+}
+
+function buildUserData(credentials) {
+  if (!credentials.key) return null;
+  return { username: "LiteLLM User", email: null, balance: null };
 }
 
 export default async function AgentConversationPage({ params }) {
   const { agent_id, conversation_id } = await params;
   const cookieStore = await cookies();
-  const apiKey = cookieStore.get("muapi_key")?.value;
+  const credentials = getLiteLLMCredentials(cookieStore);
 
-  console.log(`[ConvPage] Loading for agent: ${agent_id}, conv: ${conversation_id}, hasKey: ${!!apiKey}`);
-
-  const [agentDetails, initialHistory, userData] = await Promise.all([
-    fetchAgentDetails(agent_id, apiKey),
-    fetchHistory(agent_id, conversation_id, apiKey),
-    fetchUserData(apiKey)
+  const [agentDetails, initialHistory] = await Promise.all([
+    fetchAgentDetails(agent_id, credentials),
+    fetchHistory(agent_id, conversation_id, credentials),
   ]);
 
   return (
-    <AgentChatClient 
-      agentDetails={agentDetails} 
-      initialHistory={initialHistory} 
-      userData={userData}
+    <AgentChatClient
+      agentDetails={agentDetails}
+      initialHistory={initialHistory}
+      userData={buildUserData(credentials)}
     />
   );
 }
